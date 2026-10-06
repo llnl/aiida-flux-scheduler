@@ -123,6 +123,62 @@ class FluxScheduler(Scheduler):
         """
 
         return f"flux job info {job_id} jobspec"
+
+    def submit_job(
+        self,
+        working_directory: str,
+        submit_script: str,
+    ) -> str | ExitCode:
+        """Submit a job to Flux.
+
+        :param working_directory: Absolute path to the job working directory.
+        :param submit_script: Submission script relative to that directory.
+        """
+
+        self.transport.chdir(working_directory)
+        with self.transport:
+            result = self.transport.exec_command_wait(
+                self._get_submit_command(submit_script)
+            )
+
+        return self._parse_submit_output(*result)
+
+    def get_jobs(
+        self,
+        jobs: list[str] | None = None,
+        user: str | None = None,
+        as_dict: bool = False,
+    ) -> list[JobInfo] | dict[str, JobInfo]:
+        """Return currently active Flux jobs.
+
+        :param jobs: Optional list of job IDs to query.
+        :param user: Optional username used to filter jobs.
+        :param as_dict: Return a mapping keyed by job ID when true.
+        """
+
+        with self.transport:
+            result = self.transport.exec_command_wait(
+                self._get_joblist_command(jobs=jobs, user=user)
+            )
+
+        job_list = self._parse_joblist_output(*result)
+        if as_dict:
+            job_dict = {job.job_id: job for job in job_list}
+            if None in job_dict:
+                raise SchedulerError('Found at least one job without jobid')
+            return job_dict
+
+        return job_list
+
+    def kill_job(self, jobid: str) -> bool:
+        """Cancel a Flux job and return whether cancellation succeeded."""
+
+        with self.transport:
+            result = self.transport.exec_command_wait(
+                self._get_kill_command(jobid)
+            )
+
+        return self._parse_kill_output(*result)
         
     def _get_submit_script_header(
         self, 
@@ -266,7 +322,9 @@ class FluxScheduler(Scheduler):
         if retval != 0:
             self.logger.error(f'Error in _parse_submit_output: {retval=}; {stdout=}; {stderr=}')
 
-            raise SchedulerError(f'Error during submission, {retval=}\{stdout=}\{stderr=}')
+            raise SchedulerError(
+                f'Error during submission, {retval=}, {stdout=}, {stderr=}'
+            )
 
         try:
             transport_string = f' for {self.transport}'
@@ -450,7 +508,7 @@ class FluxScheduler(Scheduler):
                 f'text in stdout: {stdout}'
             )
 
-        return 
+        return True
     
     def parse_output(
         self, 

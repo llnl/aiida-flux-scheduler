@@ -172,10 +172,16 @@ class FluxScheduler(Scheduler):
         :return comm: Command for detailed job info.
         """
 
-        flux_id, child_id = job_id.split(':')
+        allocation_id, separator, child_id = job_id.partition(':')
+        if separator:
+            if not allocation_id or not child_id or ':' in child_id:
+                raise ValueError(f'Invalid pooled Flux job ID: {job_id!r}')
+            return (
+                f'flux proxy {shlex.quote(allocation_id)} '
+                f'flux job info {shlex.quote(child_id)} jobspec'
+            )
 
-        return f"flux proxy {flux_id} flux job info {child_id} jobspec"
-
+        return f'flux job info {shlex.quote(job_id)} jobspec'
     def _get_submit_script_header(
         self,
         job_tmpl: JobTemplate
@@ -1166,7 +1172,9 @@ class FluxScheduler(Scheduler):
         if retval != 0:
             self.logger.error(f'Error in _parse_submit_output: {retval=}; {stdout=}; {stderr=}')
 
-            raise SchedulerError(f'Error during submission, {retval=}\n{stdout=}\n{stderr=}')
+            raise SchedulerError(
+                f'Error during submission, {retval=}, {stdout=}, {stderr=}'
+            )
 
         try:
             transport_string = f' for {self.transport}'
@@ -1384,8 +1392,7 @@ class FluxScheduler(Scheduler):
                 f'text in stdout: {stdout}'
             )
 
-        return
-
+        return True
     def parse_output(
         self,
         detailed_job_info: dict[str, str | int] | None = None,

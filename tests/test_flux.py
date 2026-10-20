@@ -227,6 +227,25 @@ def test_kill_command_rejects_malformed_pooled_job_id(job_id):
         scheduler._get_kill_command(job_id)
 
 
+def test_detailed_job_info_command_handles_pooled_and_direct_jobs():
+    scheduler = FluxScheduler()
+
+    assert scheduler._get_detailed_job_info_command('allocation-123:child-456') == (
+        'flux proxy allocation-123 flux job info child-456 jobspec'
+    )
+    assert scheduler._get_detailed_job_info_command('top-level-123') == (
+        'flux job info top-level-123 jobspec'
+    )
+
+
+@pytest.mark.parametrize('job_id', ['allocation-123:', ':child-456', 'outer:child:extra'])
+def test_detailed_job_info_command_rejects_malformed_pooled_job_id(job_id):
+    scheduler = FluxScheduler()
+
+    with pytest.raises(ValueError, match='Invalid pooled Flux job ID'):
+        scheduler._get_detailed_job_info_command(job_id)
+
+
 def test_check_allocation_matches_exact_title_only():
     scheduler = FluxScheduler()
 

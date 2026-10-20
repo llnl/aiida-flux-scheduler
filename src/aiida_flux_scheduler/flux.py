@@ -3,8 +3,10 @@ Plugin for Flux.
 """
 
 import datetime
+import hashlib
 import json
 import re
+import shlex
 import time
 from collections import defaultdict, namedtuple
 from typing import Any
@@ -48,6 +50,10 @@ class FluxJobResource(NodeNumberJobResource):
     Class for Flux job resources.
     """
 
+    _default_fields = NodeNumberJobResource._default_fields + (
+        'num_gpus_per_mpiproc',
+    )
+
     @classmethod
     def validate_resources(
         cls,
@@ -71,6 +77,11 @@ class FluxJobResource(NodeNumberJobResource):
                 )
 
         resources = super().validate_resources(**kwargs)
+        if (
+            resources.num_gpus_per_mpiproc is not None
+            and resources.num_gpus_per_mpiproc < 1
+        ):
+            raise ValueError('`num_gpus_per_mpiproc` must be greater than or equal to one.')
         resources['max_wallclock_seconds'] = mws
         resources['flux_pool'] = flux_pool
 
@@ -223,6 +234,11 @@ class FluxScheduler(Scheduler):
                 f'#flux: -c {job_tmpl.job_resource.num_cores_per_mpiproc}'
             )
 
+        if job_tmpl.job_resource.num_gpus_per_mpiproc:
+            header.append(
+                f'#flux: -g {job_tmpl.job_resource.num_gpus_per_mpiproc}'
+            )
+
         if job_tmpl.max_wallclock_seconds is not None:
             try:
                 tot_secs = int(job_tmpl.max_wallclock_seconds)
@@ -296,15 +312,12 @@ class FluxScheduler(Scheduler):
             self.logger.error(f'Error in _flux_allocation: {retval=}; {stdout=}; {stderr=}')
             raise SchedulerError(f'Error during submission, {retval=}\n{stdout=}\n{stderr=}')
 
-        self.flux_values = {}
-        items = stdout.strip().split('\n')
-        for item in items:
-            item = item.replace('#flux:', '').strip().strip('-')
-            if '=' in item:
-                item = item.split('=')
-            else:
-                item = item.split()
-            self.flux_values[item[0]] = item[1]
+        self.flux_values = self._parse_flux_directives(stdout)
+
+        if 't' not in self.flux_values or 'job-name' not in self.flux_values:
+            raise SchedulerError(
+                'The Flux submit script must contain time-limit and job-name directives.'
+            )
 
         # Convert walltime to seconds
         walltime = self.flux_values['t']
@@ -319,6 +332,34 @@ class FluxScheduler(Scheduler):
         pk = int(self.flux_values['job-name'].split('-')[-1])
 
         return pk
+
+    @staticmethod
+    def _parse_flux_directives(output: str) -> dict[str, str]:
+        """Parse only the Flux directives needed to identify an AiiDA job."""
+
+        values = {}
+        for line in output.splitlines():
+            _, _, directive = line.partition('#flux:')
+            if not directive:
+                continue
+            try:
+                tokens = shlex.split(directive, comments=True)
+            except ValueError:
+                continue
+
+            for index, token in enumerate(tokens):
+                if token.startswith('--job-name='):
+                    values['job-name'] = token.split('=', maxsplit=1)[1]
+                elif token == '--job-name' and index + 1 < len(tokens):
+                    values['job-name'] = tokens[index + 1]
+                elif token.startswith('--time-limit='):
+                    values['t'] = token.split('=', maxsplit=1)[1]
+                elif token in ('-t', '--time-limit') and index + 1 < len(tokens):
+                    values['t'] = tokens[index + 1]
+                elif token.startswith('-t') and token != '-t':
+                    values['t'] = token[2:]
+
+        return values
 
 
     def _flux_allocation(
@@ -340,6 +381,7 @@ class FluxScheduler(Scheduler):
 
         allocation_config = self._resolve_allocation_config(node)
         if allocation_config.get('pool'):
+            self._validate_job_fits_pool(node, allocation_config)
             flux_id = self._get_or_create_pooled_allocation(
                 node,
                 parent_pk,
@@ -427,6 +469,8 @@ class FluxScheduler(Scheduler):
             ('queue_name', 'queue_name'),
             ('max_wallclock_seconds', 'max_wallclock_seconds'),
             ('account', 'account'),
+            ('num_cores_per_mpiproc', 'num_cores_per_mpiproc'),
+            ('num_gpus_per_mpiproc', 'num_gpus_per_mpiproc'),
         )
 
         allocation_resources = {}
@@ -444,6 +488,12 @@ class FluxScheduler(Scheduler):
             if 'num_mpiprocs_per_machine' in allocation_resources:
                 num_tasks = num_machines * int(allocation_resources['num_mpiprocs_per_machine'])
                 values['num_tasks'] = f'-n {num_tasks}'
+
+        if 'num_cores_per_mpiproc' in allocation_resources:
+            values['cores_per_task'] = f'-c {int(allocation_resources["num_cores_per_mpiproc"])}'
+
+        if 'num_gpus_per_mpiproc' in allocation_resources:
+            values['gpus_per_task'] = f'-g {int(allocation_resources["num_gpus_per_mpiproc"])}'
 
         if 'queue_name' in allocation_resources:
             values['queue_name'] = f'-q {allocation_resources["queue_name"]}'
@@ -463,7 +513,8 @@ class FluxScheduler(Scheduler):
 
         flux_submit = (
             'flux alloc {job_name} {num_machines} {num_tasks} '
-            '{queue_name} {account} {max_wallclock_seconds} -x --bg {watcher}'
+            '{cores_per_task} {gpus_per_task} {queue_name} {account} '
+            '{max_wallclock_seconds} -x --bg {watcher}'
         )
 
         flux_submit = flux_submit.format_map(values)
@@ -519,6 +570,52 @@ class FluxScheduler(Scheduler):
             'pool': pool_name,
             'resources': resources,
         }
+
+    def _validate_job_fits_pool(
+        self,
+        node: CalcJobNode,
+        allocation_config: dict[str, Any],
+    ) -> None:
+        """Reject resource shapes that can never fit in the selected pool."""
+
+        job_resources = self._get_node_options(node).get('resources', {})
+        pool_resources = allocation_config.get('resources', {})
+
+        def value(resources: dict[str, Any], key: str, default: int) -> int:
+            result = self.recursive_dict_search(key, resources)
+            return default if result is None else int(result)
+
+        job_nodes = value(job_resources, 'num_machines', 1)
+        pool_nodes = value(pool_resources, 'num_machines', 1)
+        job_slots_per_node = value(job_resources, 'num_mpiprocs_per_machine', 1)
+        pool_slots_per_node = value(pool_resources, 'num_mpiprocs_per_machine', 1)
+        job_cores_per_slot = value(job_resources, 'num_cores_per_mpiproc', 1)
+        pool_cores_per_slot = value(pool_resources, 'num_cores_per_mpiproc', 1)
+        job_gpus_per_slot = value(job_resources, 'num_gpus_per_mpiproc', 0)
+        pool_gpus_per_slot = value(pool_resources, 'num_gpus_per_mpiproc', 0)
+
+        requested = {'nodes': job_nodes}
+        available = {'nodes': pool_nodes}
+        if self.recursive_dict_search('num_cores_per_mpiproc', pool_resources) is not None:
+            requested['cores per node'] = job_slots_per_node * job_cores_per_slot
+            available['cores per node'] = pool_slots_per_node * pool_cores_per_slot
+        if job_gpus_per_slot or pool_gpus_per_slot:
+            requested['GPUs per node'] = job_slots_per_node * job_gpus_per_slot
+            available['GPUs per node'] = pool_slots_per_node * pool_gpus_per_slot
+        exceeded = [
+            name
+            for name, requested_value in requested.items()
+            if requested_value > available[name]
+        ]
+        if exceeded:
+            details = ', '.join(
+                f'{name}={requested[name]} (pool {available[name]})'
+                for name in exceeded
+            )
+            raise SchedulerError(
+                f'Job resource request cannot fit in Flux pool '
+                f'`{allocation_config["pool"]}`: {details}.'
+            )
 
     def _load_pool_definition(
         self,
@@ -580,16 +677,15 @@ class FluxScheduler(Scheduler):
         """
 
         pool_name = allocation_config['pool']
+        lock_name = self._get_pool_lock_name(node, pool_name)
         lock_timeout_seconds = int(allocation_config.get('lock_timeout_seconds', 60))
-        stale_lock_seconds = int(
-            allocation_config.get(
-                'stale_lock_seconds',
-                max(lock_timeout_seconds, 300),
-            )
+        stale_lock_value = allocation_config.get('stale_lock_seconds')
+        stale_lock_seconds = (
+            None if stale_lock_value is None else int(stale_lock_value)
         )
 
         self._acquire_pool_lock(
-            pool_name,
+            lock_name,
             timeout_seconds=lock_timeout_seconds,
             stale_lock_seconds=stale_lock_seconds,
         )
@@ -604,6 +700,19 @@ class FluxScheduler(Scheduler):
 
             if current_flux_id:
                 job_info = self._get_top_level_job(current_flux_id)
+                expected_job_name = allocation_config.get(
+                    'job_name', f'aiida-pool-{pool_name}'
+                )
+                if (
+                    job_info is not None
+                    and job_info.title is not None
+                    and job_info.title != expected_job_name
+                ):
+                    self.logger.warning(
+                        f'Flux pool `{pool_name}` runtime id `{current_flux_id}` '
+                        f'refers to job `{job_info.title}`, not `{expected_job_name}`.'
+                    )
+                    job_info = None
                 if job_info is not None:
                     remaining = self._get_remaining_walltime(job_info)
                     if remaining >= self.flux_values['t']:
@@ -619,9 +728,9 @@ class FluxScheduler(Scheduler):
 
                     self.logger.info(
                         f'Flux pool `{pool_name}` allocation `{current_flux_id}` '
-                        'does not have enough remaining walltime; replacing it.'
+                        'does not have enough remaining walltime; allowing it to '
+                        'drain while starting a replacement.'
                     )
-                    self._cancel_job_if_exists(current_flux_id)
                 else:
                     self.logger.info(
                         f'Flux pool `{pool_name}` allocation `{current_flux_id}` '
@@ -640,7 +749,16 @@ class FluxScheduler(Scheduler):
             )
             return flux_id
         finally:
-            self._release_pool_lock(pool_name)
+            self._release_pool_lock(lock_name)
+
+    @staticmethod
+    def _get_pool_lock_name(node: CalcJobNode, pool_name: str) -> str:
+        """Return a collision-resistant lock name scoped to user and computer."""
+
+        identity = f'{node.user.email}\0{node.computer.label}\0{pool_name}'
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+        safe_pool_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', pool_name)[:48]
+        return f'{safe_pool_name}-{digest}'
 
     def _get_pool_lock_path(
         self,
@@ -657,7 +775,7 @@ class FluxScheduler(Scheduler):
         self,
         pool_name: str,
         timeout_seconds: int = 60,
-        stale_lock_seconds: int = 300,
+        stale_lock_seconds: int | None = None,
     ) -> None:
         """
         Acquire a remote directory lock for the given pool.
@@ -681,9 +799,12 @@ class FluxScheduler(Scheduler):
                 self._write_pool_lock_metadata(pool_name)
                 return
 
-            if self._recover_stale_pool_lock(
-                pool_name,
-                stale_lock_seconds=stale_lock_seconds,
+            if (
+                stale_lock_seconds is not None
+                and self._recover_stale_pool_lock(
+                    pool_name,
+                    stale_lock_seconds=stale_lock_seconds,
+                )
             ):
                 continue
 

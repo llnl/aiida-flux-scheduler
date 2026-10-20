@@ -13,6 +13,36 @@ POOL_EXTRA_KEY = 'aiida_flux_scheduler'
 POOL_RUNTIME_KEY = 'runtime'
 
 
+def validate_pool_resources(resources: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the resource envelope for a persistent pool."""
+
+    normalized = dict(resources)
+    required = (
+        'num_machines',
+        'num_mpiprocs_per_machine',
+        'max_wallclock_seconds',
+    )
+    optional_integers = ('num_cores_per_mpiproc', 'num_gpus_per_mpiproc')
+
+    for key in required + optional_integers:
+        if key not in normalized:
+            if key in required:
+                raise exceptions.ValidationError(f'Pool resource `{key}` is required.')
+            continue
+        try:
+            normalized[key] = int(normalized[key])
+        except (TypeError, ValueError) as exception:
+            raise exceptions.ValidationError(
+                f'Pool resource `{key}` must be an integer.'
+            ) from exception
+        if normalized[key] < 1:
+            raise exceptions.ValidationError(
+                f'Pool resource `{key}` must be greater than or equal to one.'
+            )
+
+    return normalized
+
+
 def build_pool_group_label(
     user_email: str,
     computer_label: str,
@@ -89,6 +119,7 @@ def create_or_update_pool_group(
     computer = Computer.collection.get(label=computer_label)
     label = build_pool_group_label(user.email, computer.label, pool_name)
 
+    resources = validate_pool_resources(resources)
     payload = {
         'name': pool_name,
         'computer': computer.label,
@@ -110,7 +141,12 @@ def create_or_update_pool_group(
         created = True
 
     existing_payload = group.base.extras.all.get(POOL_EXTRA_KEY, {})
-    if isinstance(existing_payload, dict) and POOL_RUNTIME_KEY in existing_payload:
+    configuration_unchanged = (
+        isinstance(existing_payload, dict)
+        and existing_payload.get('resources') == resources
+        and existing_payload.get('timeout') == timeout
+    )
+    if configuration_unchanged and POOL_RUNTIME_KEY in existing_payload:
         payload[POOL_RUNTIME_KEY] = existing_payload[POOL_RUNTIME_KEY]
 
     group.base.extras.set(POOL_EXTRA_KEY, payload)

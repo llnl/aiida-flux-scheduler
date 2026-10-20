@@ -26,7 +26,9 @@ Example payload:
   "timeout": "5m",
   "resources": {
     "num_machines": 4,
-    "num_mpiprocs_per_machine": 32,
+    "num_mpiprocs_per_machine": 4,
+    "num_cores_per_mpiproc": 8,
+    "num_gpus_per_mpiproc": 1,
     "max_wallclock_seconds": 14400,
     "queue_name": "batch",
     "account": "my-project"
@@ -41,6 +43,16 @@ Example payload:
   }
 }
 ```
+
+The three required resource fields are `num_machines`,
+`num_mpiprocs_per_machine`, and `max_wallclock_seconds`. Optional
+`num_cores_per_mpiproc` and `num_gpus_per_mpiproc` values must be positive
+integers. Together, these fields define the capacity retained by the outer
+`flux alloc`; they are not per-child defaults.
+
+Updating a pool's resources or timeout clears its current runtime reference.
+The old allocation is not canceled: already submitted children can drain, and
+the next submission creates an allocation matching the new definition.
 
 ## Runtime Fields
 

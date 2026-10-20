@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
-from aiida.schedulers.datastructures import JobInfo, JobState
+import pytest
+from aiida.schedulers.datastructures import JobInfo, JobState, JobTemplate
 
 from aiida_flux_scheduler.flux import FluxJobResource, FluxScheduler
 from aiida_flux_scheduler.pools import (
@@ -31,6 +32,75 @@ def test_validate_resources_accepts_flux_pool():
     assert resources['num_mpiprocs_per_machine'] == 4
     assert resources['max_wallclock_seconds'] == 60
     assert resources['flux_pool'] == 'shared'
+
+
+def test_validate_resources_accepts_gpu_count():
+    resources = FluxJobResource.validate_resources(
+        num_machines=2,
+        num_mpiprocs_per_machine=4,
+        num_gpus_per_mpiproc='1',
+    )
+
+    assert resources['num_gpus_per_mpiproc'] == 1
+
+
+@pytest.mark.parametrize('value', [0, -1])
+def test_validate_resources_rejects_non_positive_gpu_count(value):
+    with pytest.raises(ValueError, match='num_gpus_per_mpiproc'):
+        FluxJobResource.validate_resources(
+            num_machines=1,
+            num_mpiprocs_per_machine=1,
+            num_gpus_per_mpiproc=value,
+        )
+
+
+def test_submit_header_requests_gpus_per_flux_slot():
+    scheduler = FluxScheduler()
+    template = JobTemplate()
+    template.job_name = 'aiida-42'
+    template.job_resource = FluxJobResource(
+        num_machines=2,
+        num_mpiprocs_per_machine=4,
+        num_cores_per_mpiproc=8,
+        num_gpus_per_mpiproc=1,
+    )
+    template.max_wallclock_seconds = 600
+
+    header = scheduler._get_submit_script_header(template)
+
+    assert '#flux: -N 2' in header
+    assert '#flux: -n 8' in header
+    assert '#flux: -c 8' in header
+    assert '#flux: -g 1' in header
+
+
+def test_submit_header_keeps_cpu_only_jobs_gpu_free():
+    scheduler = FluxScheduler()
+    template = JobTemplate()
+    template.job_name = 'aiida-43'
+    template.job_resource = FluxJobResource(
+        num_machines=1,
+        num_mpiprocs_per_machine=8,
+        num_cores_per_mpiproc=2,
+    )
+
+    header = scheduler._get_submit_script_header(template)
+
+    assert '#flux: -N 1' in header
+    assert '#flux: -n 8' in header
+    assert '#flux: -c 2' in header
+    assert '#flux: -g' not in header
+
+
+def test_parse_flux_directives_ignores_custom_flags():
+    values = FluxScheduler._parse_flux_directives(
+        '#flux: --job-name=aiida-42\n'
+        '#flux: -t 10m\n'
+        '#flux: --exclusive\n'
+        '#flux: --setattr=user.note="GPU test"\n'
+    )
+
+    assert values == {'job-name': 'aiida-42', 't': '10m'}
 
 
 def test_parse_seconds_field_handles_float_and_blank():
@@ -73,6 +143,8 @@ def test_start_allocation_builds_expected_flux_alloc_command():
                 'queue_name': 'debug',
                 'max_wallclock_seconds': 600,
                 'account': 'project-a',
+                'num_cores_per_mpiproc': 8,
+                'num_gpus_per_mpiproc': 1,
             },
             'job_name': 'aiida-pool-shared',
             'timeout': '10m',
@@ -82,11 +154,32 @@ def test_start_allocation_builds_expected_flux_alloc_command():
 
     assert flux_id == 'flux-123'
     assert transport.commands == [
-        "flux alloc --job-name=aiida-pool-shared --nodes=2 -n 8 -q debug "
+        "flux alloc --job-name=aiida-pool-shared --nodes=2 -n 8 -c 8 -g 1 -q debug "
         "-B project-a -t 600s -x --bg bash -c 'while true; do sleep 60; if "
         "[ $(flux jobs --since=-10m | wc -l) -gt 1 ]; then continue; else "
         "exit; fi; done'"
     ]
+
+
+def test_start_allocation_keeps_cpu_only_pool_gpu_free():
+    transport = FakeTransport([(0, 'flux-123\n', '')])
+    scheduler = FluxScheduler()
+    scheduler._transport = transport
+
+    scheduler._start_allocation(
+        {
+            'resources': {
+                'num_machines': 2,
+                'num_mpiprocs_per_machine': 4,
+                'max_wallclock_seconds': 600,
+            },
+            'job_name': 'aiida-pool-cpu',
+        },
+        parent_pk=42,
+    )
+
+    assert ' -g ' not in transport.commands[0]
+    assert '--nodes=2 -n 8' in transport.commands[0]
 
 
 def test_check_allocation_matches_exact_title_only():
@@ -234,10 +327,44 @@ def test_get_or_create_pooled_allocation_reuses_existing_runtime(
     assert runtime['current_flux_id'] == 'old-id'
     assert runtime['last_used_by_parent_pk'] == 42
     assert runtime['remaining_seconds'] == 400
-    assert releases == ['shared']
+    assert releases == [scheduler._get_pool_lock_name(node, 'shared')]
 
 
-def test_get_or_create_pooled_allocation_replaces_expired_runtime(
+def test_validate_job_fits_gpu_pool():
+    scheduler = FluxScheduler()
+    node = SimpleNamespace(
+        get_metadata_inputs=lambda: {
+            'metadata': {
+                'options': {
+                    'resources': {
+                        'flux_pool': 'shared',
+                        'num_machines': 1,
+                        'num_mpiprocs_per_machine': 4,
+                        'num_cores_per_mpiproc': 4,
+                        'num_gpus_per_mpiproc': 1,
+                    }
+                }
+            }
+        }
+    )
+    pool = {
+        'pool': 'shared',
+        'resources': {
+            'num_machines': 2,
+            'num_mpiprocs_per_machine': 4,
+            'num_cores_per_mpiproc': 8,
+            'num_gpus_per_mpiproc': 1,
+        },
+    }
+
+    scheduler._validate_job_fits_pool(node, pool)
+
+    pool['resources']['num_gpus_per_mpiproc'] = 0
+    with pytest.raises(Exception, match='GPUs per node=4'):
+        scheduler._validate_job_fits_pool(node, pool)
+
+
+def test_get_or_create_pooled_allocation_drains_expired_runtime(
     aiida_profile_clean,
     aiida_computer_local,
     monkeypatch,
@@ -266,10 +393,13 @@ def test_get_or_create_pooled_allocation_replaces_expired_runtime(
     scheduler = FluxScheduler()
     scheduler.flux_values = {'t': 120}
 
-    cancelled = []
     monkeypatch.setattr(scheduler, '_acquire_pool_lock', lambda *args, **kwargs: None)
     monkeypatch.setattr(scheduler, '_release_pool_lock', lambda *args, **kwargs: None)
-    monkeypatch.setattr(scheduler, '_cancel_job_if_exists', cancelled.append)
+    monkeypatch.setattr(
+        scheduler,
+        '_cancel_job_if_exists',
+        lambda job_id: pytest.fail(f'unexpected cancellation of shared allocation {job_id}'),
+    )
     monkeypatch.setattr(scheduler, '_start_allocation', lambda *args, **kwargs: 'new-id')
 
     job = JobInfo()
@@ -287,7 +417,6 @@ def test_get_or_create_pooled_allocation_replaces_expired_runtime(
     )
 
     assert flux_id == 'new-id'
-    assert cancelled == ['old-id']
     runtime = get_pool_runtime(group)
     assert runtime['current_flux_id'] == 'new-id'
     assert runtime['last_used_by_parent_pk'] == 77

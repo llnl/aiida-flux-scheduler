@@ -33,6 +33,8 @@ The remote environment used by the computer should provide:
   `flux batch`, and `flux cancel`
 - a writable home directory for pool lock directories under
   `$HOME/.aiida-flux-scheduler/locks`
+- for GPU pools, a Flux resource inventory that exposes GPUs and supports
+  `-g` / `--gpus-per-slot` on both `flux alloc` and `flux batch`
 
 ## Verify The Scheduler Entry Point
 

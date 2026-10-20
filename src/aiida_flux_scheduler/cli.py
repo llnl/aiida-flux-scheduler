@@ -69,6 +69,18 @@ def pool() -> None:
     help='MPI processes per machine in the pool allocation.',
 )
 @click.option(
+    '--num-cores-per-mpiproc',
+    type=click.IntRange(min=1),
+    default=None,
+    help='CPU cores reserved for each pool resource slot.',
+)
+@click.option(
+    '--num-gpus-per-mpiproc',
+    type=click.IntRange(min=1),
+    default=None,
+    help='GPUs reserved for each pool resource slot.',
+)
+@click.option(
     '--max-wallclock-seconds',
     type=int,
     required=True,
@@ -83,6 +95,8 @@ def pool_create(
     account: str | None,
     num_machines: int,
     num_mpiprocs_per_machine: int,
+    num_cores_per_mpiproc: int | None,
+    num_gpus_per_mpiproc: int | None,
     max_wallclock_seconds: int,
     timeout: str,
     disabled: bool,
@@ -100,6 +114,10 @@ def pool_create(
         resources['queue_name'] = queue_name
     if account:
         resources['account'] = account
+    if num_cores_per_mpiproc is not None:
+        resources['num_cores_per_mpiproc'] = num_cores_per_mpiproc
+    if num_gpus_per_mpiproc is not None:
+        resources['num_gpus_per_mpiproc'] = num_gpus_per_mpiproc
 
     group, created = create_or_update_pool_group(
         pool_name=name,
@@ -137,6 +155,8 @@ def pool_list(computer_label: str | None) -> None:
                 'enabled': payload.get('enabled', True),
                 'num_machines': resources.get('num_machines', ''),
                 'num_mpiprocs_per_machine': resources.get('num_mpiprocs_per_machine', ''),
+                'num_cores_per_mpiproc': resources.get('num_cores_per_mpiproc', ''),
+                'num_gpus_per_mpiproc': resources.get('num_gpus_per_mpiproc', ''),
                 'max_wallclock_seconds': resources.get('max_wallclock_seconds', ''),
             }
         )

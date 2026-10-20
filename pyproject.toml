@@ -57,6 +57,7 @@ tests = [
 
 [project.entry-points.'aiida.schedulers']
 "flux" ="aiida_flux_scheduler.flux:FluxScheduler"
+"core.flux" ="aiida_flux_scheduler.flux:FluxScheduler"
 
 
 [tool.flit.module]

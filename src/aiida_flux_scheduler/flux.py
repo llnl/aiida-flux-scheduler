@@ -496,13 +496,13 @@ class FluxScheduler(Scheduler):
             values['gpus_per_task'] = f'-g {int(allocation_resources["num_gpus_per_mpiproc"])}'
 
         if 'queue_name' in allocation_resources:
-            values['queue_name'] = f'-q {allocation_resources["queue_name"]}'
+            values['queue_name'] = f'-q {shlex.quote(str(allocation_resources["queue_name"]))}'
 
         if 'max_wallclock_seconds' in allocation_resources:
             values['max_wallclock_seconds'] = f'-t {int(allocation_resources["max_wallclock_seconds"])}s'
 
         if 'account' in allocation_resources:
-            values['account'] = f'-B {allocation_resources["account"]}'
+            values['account'] = f'-B {shlex.quote(str(allocation_resources["account"]))}'
 
         job_name = allocation_config.get('job_name', f'aiida-{parent_pk}')
         values['job_name'] = f'--job-name={job_name}'
@@ -1334,7 +1334,16 @@ class FluxScheduler(Scheduler):
         :return comm: Command to kill a job within Flux.
         """
 
-        return f"flux cancel {jobid}"
+        allocation_id, separator, child_id = jobid.partition(':')
+        if separator:
+            if not allocation_id or not child_id or ':' in child_id:
+                raise ValueError(f'Invalid pooled Flux job ID: {jobid!r}')
+            return (
+                f'flux proxy {shlex.quote(allocation_id)} '
+                f'flux cancel {shlex.quote(child_id)}'
+            )
+
+        return f"flux cancel {shlex.quote(jobid)}"
 
     def _parse_kill_output(
         self,

@@ -182,6 +182,51 @@ def test_start_allocation_keeps_cpu_only_pool_gpu_free():
     assert '--nodes=2 -n 8' in transport.commands[0]
 
 
+def test_start_allocation_shell_quotes_queue_and_account():
+    transport = FakeTransport([(0, 'flux-123\n', '')])
+    scheduler = FluxScheduler()
+    scheduler._transport = transport
+
+    scheduler._start_allocation(
+        {
+            'resources': {
+                'queue_name': 'debug; unexpected-command',
+                'account': 'project name',
+            },
+        },
+        parent_pk=42,
+    )
+
+    assert "-q 'debug; unexpected-command'" in transport.commands[0]
+    assert "-B 'project name'" in transport.commands[0]
+
+
+def test_kill_job_cancels_pooled_child_through_owning_allocation():
+    transport = FakeTransport([(0, '', '')])
+    scheduler = FluxScheduler()
+    scheduler._transport = transport
+
+    assert scheduler.kill_job('allocation-123:child-456') is True
+    assert transport.commands == ['flux proxy allocation-123 flux cancel child-456']
+
+
+def test_kill_command_quotes_job_ids():
+    scheduler = FluxScheduler()
+
+    assert scheduler._get_kill_command('top; level') == "flux cancel 'top; level'"
+    assert scheduler._get_kill_command('outer id:child; id') == (
+        "flux proxy 'outer id' flux cancel 'child; id'"
+    )
+
+
+@pytest.mark.parametrize('job_id', ['allocation-123:', ':child-456', 'outer:child:extra'])
+def test_kill_command_rejects_malformed_pooled_job_id(job_id):
+    scheduler = FluxScheduler()
+
+    with pytest.raises(ValueError, match='Invalid pooled Flux job ID'):
+        scheduler._get_kill_command(job_id)
+
+
 def test_check_allocation_matches_exact_title_only():
     scheduler = FluxScheduler()
 

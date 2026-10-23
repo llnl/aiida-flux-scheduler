@@ -32,6 +32,13 @@ pip install -e .[docs]
 3. Optionally create a shared pool with `aiida-flux pool create` and select it
    from job resources with `flux_pool`.
 
+Without `flux_pool` or an explicit `flux_allocation_lifecycle`, jobs are
+submitted directly with `flux batch`; the scheduler returns the Flux job ID
+and does not create an allocation or proxy. Queue, account, and walltime
+options do not change this behavior. Set `flux_allocation_lifecycle` to
+`child` or `parent` to opt into allocation management, or use `flux_pool` to
+submit through a named shared allocation.
+
 Start with:
 
 - [Installation guide](docs/install.md)

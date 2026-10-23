@@ -14,9 +14,14 @@ For each submission, the scheduler:
 
 1. parses the generated Flux submit script headers
 2. resolves the root AiiDA process PK
-3. chooses either direct allocation behavior or pool-backed allocation behavior
-4. starts or reuses a Flux allocation
-5. submits the actual job into that allocation with `flux proxy`
+3. checks for a named `flux_pool` or an explicit
+   `flux_allocation_lifecycle`
+4. submits directly with `flux batch` and returns the plain Flux job ID when
+   neither is set; ordinary queue, account, and walltime options do not opt in
+   to allocation management
+5. for explicit `child` or `parent` lifecycle settings, starts or reuses a
+   top-level allocation and submits the job through `flux proxy`
+6. for `flux_pool`, submits through the pool's named shared allocation
 
 ## Pool Runtime Model
 

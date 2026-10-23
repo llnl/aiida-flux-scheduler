@@ -68,6 +68,7 @@ class FluxJobResource(NodeNumberJobResource):
 
         mws = kwargs.pop('max_wallclock_seconds', None)
         flux_pool = kwargs.pop('flux_pool', None)
+        allocation_lifecycle = kwargs.pop('flux_allocation_lifecycle', None)
         if mws is not None:
             try:
                 mws = int(mws)
@@ -84,6 +85,11 @@ class FluxJobResource(NodeNumberJobResource):
             raise ValueError('`num_gpus_per_mpiproc` must be greater than or equal to one.')
         resources['max_wallclock_seconds'] = mws
         resources['flux_pool'] = flux_pool
+        if allocation_lifecycle not in (None, 'parent', 'child'):
+            raise ValueError(
+                '`flux_allocation_lifecycle` must be either `parent` or `child`.'
+            )
+        resources['flux_allocation_lifecycle'] = allocation_lifecycle
 
         return resources
 
@@ -141,7 +147,8 @@ class FluxScheduler(Scheduler):
             fields['flux_id'] = flux_id
 
         if jobs:
-            command = 'flux proxy {flux_id} "' + command + '"'
+            if flux_id:
+                command = 'flux proxy {flux_id} "' + command + '"'
             joblist = []
             if isinstance(jobs, str):
                 joblist = jobs
@@ -204,12 +211,16 @@ class FluxScheduler(Scheduler):
         if job_tmpl.sched_error_path:
             header.append(f'#flux: --error={job_tmpl.sched_error_path}')
 
-        # When submitting to a flux instance you won't need to have a queue/bank
-        #if job_tmpl.queue_name:
-        #    header.append(f'#flux: -q {job_tmpl.queue_name}')
-
-        #if job_tmpl.account:
-        #    header.append(f'#flux: -B {job_tmpl.account}')
+        # Nested instances inherit the queue and bank from their allocation.
+        nested = job_tmpl.job_resource and (
+            job_tmpl.job_resource.get('flux_pool')
+            or job_tmpl.job_resource.get('flux_allocation_lifecycle')
+        )
+        if not nested:
+            if job_tmpl.queue_name:
+                header.append(f'#flux: -q {shlex.quote(job_tmpl.queue_name)}')
+            if job_tmpl.account:
+                header.append(f'#flux: -B {shlex.quote(job_tmpl.account)}')
 
         if job_tmpl.priority:
             # Check that the specified value is within the appropriate range.
@@ -310,9 +321,11 @@ class FluxScheduler(Scheduler):
         :returns: PK of the current calculation.
         """
 
-        self.transport.chdir(working_directory)
-
-        retval, stdout, stderr = self.transport.exec_command_wait(f'grep "#flux" {submit_script}')
+        command = (
+            f'cd {escape_for_bash(working_directory)} && '
+            f'grep "#flux" {escape_for_bash(submit_script)}'
+        )
+        retval, stdout, stderr = self.transport.exec_command_wait(command)
 
         if retval != 0:
             self.logger.error(f'Error in _flux_allocation: {retval=}; {stdout=}; {stderr=}')
@@ -371,7 +384,7 @@ class FluxScheduler(Scheduler):
     def _flux_allocation(
         self,
         pk: int
-    ) -> int:
+    ) -> str:
         """
         Start a flux allocation to submit jobs.
 
@@ -379,13 +392,26 @@ class FluxScheduler(Scheduler):
         :returns: Flux job ID of the persistent allocation.
         """
 
-        parent_pk = self._get_parent_pk(pk)
+        return self._flux_allocation_with_ownership(pk)[0]
+
+    def _flux_allocation_with_ownership(self, pk: int) -> tuple[str, bool]:
+        """Return an allocation ID and whether this submission created it.
+
+        Direct allocations are child-owned unless callers explicitly select
+        parent reuse. Shared pools own their allocation lifecycle independently
+        and must never be cancelled because an individual child fails.
+        """
+
         node = load_node(pk)
 
         if not isinstance(node, CalcJobNode):
             raise TypeError(f'{node} is not a recognized type for this scheduler.')
 
         allocation_config = self._resolve_allocation_config(node)
+        if not allocation_config.get('pool') and not allocation_config['lifecycle']:
+            return '', False
+
+        parent_pk = self._get_parent_pk(pk)
         if allocation_config.get('pool'):
             self._validate_job_fits_pool(node, allocation_config)
             flux_id = self._get_or_create_pooled_allocation(
@@ -396,7 +422,12 @@ class FluxScheduler(Scheduler):
             self.logger.info(
                 f"Flux pool `{allocation_config['pool']}` is using flux id: {flux_id}."
             )
-            return flux_id
+            return flux_id, False
+
+        if allocation_config['lifecycle'] == 'child':
+            flux_id = self._start_allocation(allocation_config, pk)
+            self.logger.info(f'Created child-owned Flux allocation {flux_id} for <{pk}>.')
+            return flux_id, True
 
         # Based on the parent_pk, see if there is an active flux allocation.
         state = self._check_allocation(parent_pk)
@@ -404,7 +435,14 @@ class FluxScheduler(Scheduler):
         if not state.active:
             self.logger.info(f'No flux allocation found for aiida-{parent_pk}. Starting one now.')
             flux_id = self._start_allocation(allocation_config, parent_pk)
+            created = True
         elif state.active:
+            if not self._direct_allocation_is_compatible(state.job_info, allocation_config):
+                raise SchedulerError(
+                    f'Existing direct Flux allocation `{state.flux_id}` for aiida-{parent_pk} '
+                    'is incompatible with this child resource request. Use the default '
+                    'child lifecycle or a named Flux pool.'
+                )
             # Check if there is enough walltime left for the job.
             diff = state.walltime - self.flux_values['t']
             if diff < 0:
@@ -419,12 +457,14 @@ class FluxScheduler(Scheduler):
                     self.logger.error(f'Error in _flux_allocation: {retval=}; {stdout=}; {stderr=}')
                     raise SchedulerError(f'Error during submission, {retval=}\n{stdout=}\n{stderr=}')
                 flux_id = self._start_allocation(allocation_config, parent_pk)
+                created = True
             else:
                 flux_id = state.flux_id
+                created = False
 
         self.logger.info(f'Flux instance for <{parent_pk}> is running with flux id: {flux_id}.')
 
-        return flux_id
+        return flux_id, created
 
     def _check_allocation(
         self,
@@ -439,8 +479,8 @@ class FluxScheduler(Scheduler):
         joblist = self.get_jobs()
         State = namedtuple(
             'State',
-            ['active', 'flux_id', 'walltime'],
-            defaults=[False, '', 0]
+            ['active', 'flux_id', 'walltime', 'job_info'],
+            defaults=[False, '', 0, None]
         )
 
         state = State()
@@ -450,9 +490,51 @@ class FluxScheduler(Scheduler):
                 total = job.requested_wallclock_time_seconds or 0
                 used = job.wallclock_time_seconds or 0
                 remaining = total - used
-                state = State(True, flux_id, remaining)
+                state = State(True, flux_id, remaining, job)
 
         return state
+
+    def _direct_allocation_is_compatible(
+        self,
+        job_info: JobInfo | None,
+        allocation_config: dict[str, Any],
+    ) -> bool:
+        """Return whether a reusable direct allocation matches child resources."""
+
+        if job_info is None:
+            return False
+
+        resources = allocation_config.get('resources', {})
+        requested_nodes = self.recursive_dict_search('num_machines', resources)
+        if requested_nodes is not None and job_info.num_machines != int(requested_nodes):
+            return False
+
+        requested_slots = self.recursive_dict_search('num_mpiprocs_per_machine', resources)
+        if requested_slots is None:
+            requested_slots = self.recursive_dict_search('num_mpi_procs_per_machine', resources)
+        requested_cores = self.recursive_dict_search('num_cores_per_mpiproc', resources)
+        if requested_slots is not None:
+            if job_info.num_mpiprocs is None:
+                return False
+            expected_cpus = int(requested_nodes or 1) * int(requested_slots)
+            if requested_cores is not None:
+                expected_cpus *= int(requested_cores)
+            if job_info.num_mpiprocs != expected_cpus:
+                return False
+
+        requested_queue = self.recursive_dict_search('queue_name', resources)
+        if requested_queue is not None and job_info.queue_name != requested_queue:
+            return False
+
+        # ``flux jobs`` does not expose the parent allocation's GPU shape or
+        # bank. Reuse is unsafe if either has been requested but cannot be
+        # verified from the scheduler record.
+        if self.recursive_dict_search('num_gpus_per_mpiproc', resources) is not None:
+            return False
+        if self.recursive_dict_search('account', resources) is not None:
+            return False
+
+        return True
 
     def _start_allocation(
         self,
@@ -561,20 +643,34 @@ class FluxScheduler(Scheduler):
         Resolve allocation configuration for a job submission.
 
         This is a temporary seam for the future pool registry. For now, the
-        allocation envelope is taken directly from the scheduler resources,
-        while still allowing users to pass a `flux_pool` selector there.
+        allocation envelope combines the resource shape with AiiDA's standard
+        top-level scheduler options. A pool selector remains a resource key.
         """
 
         options = self._get_node_options(node)
-        resources = options.get('resources', {})
+        resources = dict(options.get('resources', {}))
+        # AiiDA stores these scheduler options alongside ``resources``. Keep
+        # them in the resolved envelope so ``flux alloc`` receives the same
+        # queue, bank, and walltime requested by the CalcJob.
+        for key in ('queue_name', 'account', 'max_wallclock_seconds'):
+            if options.get(key) is not None:
+                resources[key] = options[key]
         pool_name = self.recursive_dict_search('flux_pool', resources)
 
         if pool_name:
+            if self.recursive_dict_search('flux_allocation_lifecycle', resources) is not None:
+                raise SchedulerError(
+                    '`flux_allocation_lifecycle` cannot be used with `flux_pool`; '
+                    'named pools always retain their shared allocation lifecycle.'
+                )
             return self._load_pool_definition(node, pool_name)
 
         return {
             'pool': pool_name,
             'resources': resources,
+            'lifecycle': self.recursive_dict_search(
+                'flux_allocation_lifecycle', resources
+            ),
         }
 
     def _validate_job_fits_pool(
@@ -1077,19 +1173,24 @@ class FluxScheduler(Scheduler):
         if jobs:
             joblist = []
             for job in jobs:
-                flux_id, child_id = job.split(':')
+                allocation_id, separator, child_id = job.partition(':')
+                if separator and (not allocation_id or not child_id or ':' in child_id):
+                    raise ValueError(f'Invalid pooled Flux job ID: {job!r}')
+                flux_id = allocation_id if separator else None
+                query_id = child_id if separator else allocation_id
                 with self.transport:
                     retval, stdout, stderr = self.transport.exec_command_wait(
                         self._get_joblist_command(
-                            jobs=[child_id],
+                            jobs=[query_id],
                             user=user,
                             flux_id=flux_id
                         )
                     )
 
-                single_job = self._parse_joblist_output(retval, stdout, stderr)[0]
-                single_job.job_id = f'{flux_id}:{single_job.job_id}'
-                joblist.append(single_job)
+                for single_job in self._parse_joblist_output(retval, stdout, stderr):
+                    if flux_id:
+                        single_job.job_id = f'{flux_id}:{single_job.job_id}'
+                    joblist.append(single_job)
         else:
             with self.transport:
                 retval, stdout, stderr = self.transport.exec_command_wait(
@@ -1111,7 +1212,9 @@ class FluxScheduler(Scheduler):
     def _get_submit_command(
         self,
         submit_script: str,
-        flux_id: str
+        flux_id: str | None = None,
+        queue_name: str | None = None,
+        account: str | None = None,
     ) -> str:
         """
         Return the string to execute the submission script.
@@ -1121,7 +1224,16 @@ class FluxScheduler(Scheduler):
         :return submit_command: Command used to submit the submission script.
         """
 
-        submit_command = f"flux proxy {flux_id} flux batch {submit_script}"
+        submit_command = f'flux batch {submit_script}'
+        if flux_id:
+            submit_command = f'flux proxy {shlex.quote(flux_id)} {submit_command}'
+        else:
+            options = []
+            if queue_name:
+                options.append(f'-q {shlex.quote(queue_name)}')
+            if account:
+                options.append(f'-B {shlex.quote(account)}')
+            submit_command = ' '.join(['flux batch', *options, submit_script])
 
         self.logger.info(f'submitting with : {submit_command}')
 
@@ -1140,17 +1252,38 @@ class FluxScheduler(Scheduler):
         """
 
         pk = self._parse_pk(working_directory, submit_script)
-        flux_id = self._flux_allocation(pk)
-        self.transport.chdir(working_directory)
-        result = self.transport.exec_command_wait(
-            self._get_submit_command(
-                escape_for_bash(submit_script),
-                flux_id
-            )
+        flux_id, created_direct_allocation = self._flux_allocation_with_ownership(pk)
+        # Already-uploaded scripts may predate direct queue/bank headers. Use
+        # recorded options on the command line as well so resuming is safe.
+        options = self._get_node_options(load_node(pk)) if not flux_id else {}
+        # ``core.ssh_async`` transports do not implement ``chdir``. Submit
+        # from the CalcJob work directory explicitly so both synchronous and
+        # asynchronous AiiDA transports use the same scheduler path.
+        command = self._get_submit_command(
+            escape_for_bash(submit_script),
+            flux_id,
+            queue_name=options.get('queue_name'),
+            account=options.get('account'),
         )
-        child_job_id = self._parse_submit_output(*result)
+        result = self.transport.exec_command_wait(
+            f'cd {escape_for_bash(working_directory)} && {command}'
+        )
+        try:
+            child_job_id = self._parse_submit_output(*result)
+        except SchedulerError:
+            # Only a non-zero command status proves Flux rejected the child.
+            # A transport exception or absent stdout can occur after Flux has
+            # accepted it, so cancelling the allocation in those cases could
+            # kill an unrecorded running child.
+            if created_direct_allocation and result[0] != 0:
+                self.logger.warning(
+                    'Flux rejected child submission; cancelling newly created '
+                    f'direct Flux allocation `{flux_id}`.'
+                )
+                self._cancel_job_if_exists(flux_id)
+            raise
 
-        total_job_id = f'{flux_id}:{child_job_id}'
+        total_job_id = f'{flux_id}:{child_job_id}' if flux_id else child_job_id
 
         return total_job_id
 
@@ -1189,7 +1322,7 @@ class FluxScheduler(Scheduler):
             return stdout
         self.logger.error(f' in _parse_submit_output{transport_string}: unable to find the job id: {stdout}')
         raise SchedulerError(
-            'Error during submission, cound not retrieve the jobID from flux output; see log for more info.'
+            'Error during submission, could not retrieve the jobID from flux output; see log for more info.'
         )
 
     def _parse_joblist_output(

@@ -19,6 +19,91 @@ class FakeTransport:
         self.commands.append(command)
         return self.responses.pop(0)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_submit_job_uses_shell_cd_for_async_transport(monkeypatch):
+    """Submit from the work directory without requiring transport.chdir."""
+
+    scheduler = FluxScheduler()
+    transport = FakeTransport(
+        [
+            (0, '#flux: --job-name=aiida-42\n#flux: -t 5m\n', ''),
+            (0, 'child-456\n', ''),
+        ]
+    )
+    scheduler._transport = transport
+    monkeypatch.setattr(
+        scheduler, '_flux_allocation_with_ownership', lambda _: ('alloc-123', False)
+    )
+
+    assert scheduler.submit_job('/remote/work directory', '_aiidasubmit.sh') == 'alloc-123:child-456'
+    assert transport.commands == [
+        "cd '/remote/work directory' && grep \"#flux\" '_aiidasubmit.sh'",
+        "cd '/remote/work directory' && flux proxy alloc-123 flux batch '_aiidasubmit.sh'"
+    ]
+
+
+def test_submit_job_cancels_new_direct_allocation_when_child_submit_fails(monkeypatch):
+    """Do not leave a direct allocation running after its first child fails."""
+
+    scheduler = FluxScheduler()
+    scheduler._transport = FakeTransport(
+        [(0, '#flux: --job-name=aiida-42\n#flux: -t 5m\n', ''), (1, '', 'batch failed')]
+    )
+    monkeypatch.setattr(
+        scheduler, '_flux_allocation_with_ownership', lambda _: ('alloc-123', True)
+    )
+    cancelled = []
+    monkeypatch.setattr(scheduler, '_cancel_job_if_exists', cancelled.append)
+
+    with pytest.raises(Exception, match='Error during submission'):
+        scheduler.submit_job('/remote/work', '_aiidasubmit.sh')
+
+    assert cancelled == ['alloc-123']
+
+
+def test_submit_job_does_not_cancel_reused_or_pooled_allocation_on_failure(monkeypatch):
+    scheduler = FluxScheduler()
+    scheduler._transport = FakeTransport(
+        [(0, '#flux: --job-name=aiida-42\n#flux: -t 5m\n', ''), (1, '', 'batch failed')]
+    )
+    monkeypatch.setattr(
+        scheduler, '_flux_allocation_with_ownership', lambda _: ('alloc-123', False)
+    )
+    monkeypatch.setattr(
+        scheduler,
+        '_cancel_job_if_exists',
+        lambda job_id: pytest.fail(f'unexpected cancellation of {job_id}'),
+    )
+
+    with pytest.raises(Exception, match='Error during submission'):
+        scheduler.submit_job('/remote/work', '_aiidasubmit.sh')
+
+
+def test_submit_job_does_not_cancel_on_ambiguous_child_submission(monkeypatch):
+    """Keep a new allocation when Flux may have accepted an unreported child."""
+
+    scheduler = FluxScheduler()
+    scheduler._transport = FakeTransport(
+        [(0, '#flux: --job-name=aiida-42\n#flux: -t 5m\n', ''), (0, '', '')]
+    )
+    monkeypatch.setattr(
+        scheduler, '_flux_allocation_with_ownership', lambda _: ('alloc-123', True)
+    )
+    monkeypatch.setattr(
+        scheduler,
+        '_cancel_job_if_exists',
+        lambda job_id: pytest.fail(f'unexpected cancellation of {job_id}'),
+    )
+
+    with pytest.raises(Exception, match='could not retrieve'):
+        scheduler.submit_job('/remote/work', '_aiidasubmit.sh')
+
 
 def test_validate_resources_accepts_flux_pool():
     resources = FluxJobResource.validate_resources(
@@ -32,6 +117,38 @@ def test_validate_resources_accepts_flux_pool():
     assert resources['num_mpiprocs_per_machine'] == 4
     assert resources['max_wallclock_seconds'] == 60
     assert resources['flux_pool'] == 'shared'
+    assert resources['flux_allocation_lifecycle'] is None
+
+
+def test_validate_resources_accepts_child_owned_lifecycle():
+    resources = FluxJobResource.validate_resources(
+        num_machines=1,
+        num_mpiprocs_per_machine=1,
+        flux_allocation_lifecycle='child',
+    )
+
+    assert resources['flux_allocation_lifecycle'] == 'child'
+
+
+def test_validate_resources_accepts_explicit_parent_lifecycle():
+    """Allow root-workchain allocation reuse only when explicitly requested."""
+
+    resources = FluxJobResource.validate_resources(
+        num_machines=1,
+        num_mpiprocs_per_machine=1,
+        flux_allocation_lifecycle='parent',
+    )
+
+    assert resources['flux_allocation_lifecycle'] == 'parent'
+
+
+def test_validate_resources_rejects_unknown_allocation_lifecycle():
+    with pytest.raises(ValueError, match='flux_allocation_lifecycle'):
+        FluxJobResource.validate_resources(
+            num_machines=1,
+            num_mpiprocs_per_machine=1,
+            flux_allocation_lifecycle='pool',
+        )
 
 
 def test_validate_resources_accepts_gpu_count():
@@ -268,6 +385,143 @@ def test_check_allocation_matches_exact_title_only():
     assert state.active is True
     assert state.flux_id == '222'
     assert state.walltime == 75
+
+
+def test_direct_allocation_reuse_rejects_incompatible_resources():
+    scheduler = FluxScheduler()
+    job = JobInfo()
+    job.num_machines = 1
+    job.num_mpiprocs = 8
+    job.queue_name = 'debug'
+
+    assert scheduler._direct_allocation_is_compatible(
+        job,
+        {'resources': {'num_machines': 1, 'num_mpiprocs_per_machine': 4, 'num_cores_per_mpiproc': 2, 'queue_name': 'debug'}},
+    )
+    assert not scheduler._direct_allocation_is_compatible(
+        job,
+        {'resources': {'num_machines': 2, 'num_mpiprocs_per_machine': 4, 'num_cores_per_mpiproc': 2}},
+    )
+    assert not scheduler._direct_allocation_is_compatible(
+        job,
+        {'resources': {'num_machines': 1, 'num_mpiprocs_per_machine': 4, 'num_cores_per_mpiproc': 2, 'queue_name': 'other'}},
+    )
+    assert not scheduler._direct_allocation_is_compatible(
+        job,
+        {'resources': {'num_machines': 1, 'num_gpus_per_mpiproc': 1}},
+    )
+    assert not scheduler._direct_allocation_is_compatible(
+        job,
+        {'resources': {'num_machines': 1, 'account': 'project-a'}},
+    )
+
+
+def test_explicit_child_allocation_uses_child_ownership(monkeypatch):
+    """Create a calculation-owned allocation only when explicitly selected."""
+
+    scheduler = FluxScheduler()
+    node = SimpleNamespace()
+    monkeypatch.setattr('aiida_flux_scheduler.flux.load_node', lambda _: node)
+    monkeypatch.setattr('aiida_flux_scheduler.flux.CalcJobNode', SimpleNamespace)
+    monkeypatch.setattr(scheduler, '_get_parent_pk', lambda _: 10)
+    monkeypatch.setattr(
+        scheduler,
+        '_resolve_allocation_config',
+        lambda _: {'pool': None, 'resources': {}, 'lifecycle': 'child'},
+    )
+    monkeypatch.setattr(scheduler, '_start_allocation', lambda _, pk: f'alloc-{pk}')
+    monkeypatch.setattr(
+        scheduler,
+        '_check_allocation',
+        lambda _: pytest.fail('default child ownership must not look up a parent allocation'),
+    )
+
+    assert scheduler._flux_allocation_with_ownership(42) == ('alloc-42', True)
+
+
+def test_resolve_direct_allocation_merges_standard_scheduler_options():
+    """Pass top-level AiiDA queue, account, and walltime to ``flux alloc``."""
+
+    node = SimpleNamespace(
+        get_metadata_inputs=lambda: {
+            'metadata': {
+                'options': {
+                    'resources': {'num_machines': 1},
+                    'queue_name': 'pdebug',
+                    'account': 'qnoise',
+                    'max_wallclock_seconds': 900,
+                }
+            }
+        }
+    )
+
+    config = FluxScheduler()._resolve_allocation_config(node)
+
+    assert config['pool'] is None
+    assert config['lifecycle'] is None
+    assert config['resources'] == {
+        'num_machines': 1,
+        'queue_name': 'pdebug',
+        'account': 'qnoise',
+        'max_wallclock_seconds': 900,
+    }
+
+
+@pytest.mark.parametrize('pool', [None, ''])
+def test_submit_job_defaults_to_direct_batch(monkeypatch, pool):
+    """Ordinary scheduler options must not start or proxy into an allocation."""
+    scheduler = FluxScheduler()
+    scheduler._transport = FakeTransport([
+        (0, '#flux: --job-name=aiida-42\n#flux: -t 15m\n', ''),
+        (0, 'direct-123\n', ''),
+    ])
+    node = SimpleNamespace(get_metadata_inputs=lambda: {
+        'metadata': {'options': {
+            'resources': {'num_machines': 1, 'flux_pool': pool},
+            'queue_name': 'pdebug', 'account': 'qnoise',
+            'max_wallclock_seconds': 900,
+        }},
+    })
+    monkeypatch.setattr('aiida_flux_scheduler.flux.load_node', lambda _: node)
+    monkeypatch.setattr('aiida_flux_scheduler.flux.CalcJobNode', SimpleNamespace)
+    monkeypatch.setattr(scheduler, '_get_parent_pk', lambda _: pytest.fail('parent lookup'))
+    monkeypatch.setattr(scheduler, '_start_allocation', lambda *args: pytest.fail('allocation'))
+    assert scheduler.submit_job('/remote/work directory', '_aiidasubmit.sh') == 'direct-123'
+    assert scheduler._transport.commands[-1] == (
+        "cd '/remote/work directory' && flux batch -q pdebug -B qnoise '_aiidasubmit.sh'"
+    )
+
+
+@pytest.mark.parametrize('selector', [{}, {'flux_pool': 'shared'}, {'flux_allocation_lifecycle': 'child'}, {'flux_allocation_lifecycle': 'parent'}])
+def test_submit_header_queue_and_bank_only_for_direct_jobs(selector):
+    """Direct batch jobs request their queue and bank in the submit script."""
+    template = JobTemplate()
+    template.job_resource = FluxJobResource(num_machines=1, num_mpiprocs_per_machine=1, **selector)
+    template.queue_name = 'pdebug'
+    template.account = 'bank name'
+    header = FluxScheduler()._get_submit_script_header(template)
+    assert ('#flux: -q pdebug' in header) is (not selector)
+    assert ("#flux: -B 'bank name'" in header) is (not selector)
+
+
+@pytest.mark.parametrize('job_id', ['direct-123', 'alloc-123:child-456'])
+def test_get_jobs_supports_direct_and_nested_ids(job_id):
+    """Monitor both direct batch jobs and existing allocation-backed jobs."""
+    scheduler = FluxScheduler()
+    local_id = job_id.split(':')[-1]
+    scheduler._transport = FakeTransport([(0, f'HEADER\n{local_id}|R||user|1|4|node|pdebug|900|1||test|\n', '')])
+    jobs = scheduler.get_jobs(jobs=[job_id], as_dict=True)
+    assert job_id in jobs
+    command = scheduler._transport.commands[0]
+    assert ('flux proxy' in command) is (':' in job_id)
+    assert f'flux jobs {local_id}' in command
+
+
+def test_get_jobs_handles_missing_direct_job():
+    """Return an empty mapping when Flux no longer reports the requested job."""
+    scheduler = FluxScheduler()
+    scheduler._transport = FakeTransport([(0, '', '')])
+    assert scheduler.get_jobs(jobs=['direct-123'], as_dict=True) == {}
 
 
 def test_acquire_pool_lock_recovers_stale_lock(monkeypatch):

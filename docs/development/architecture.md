@@ -1,12 +1,14 @@
 # Architecture
 
-The plugin has three main pieces:
+The plugin has four main pieces:
 
 - the `FluxScheduler` implementation, which translates AiiDA scheduler calls to
   Flux CLI commands
 - the pool registry helpers, which store named pool definitions in AiiDA group
   extras
 - the pool CLI, which manages those stored definitions
+- the remote deferred-submission journal, which preserves allocation and child
+  acceptance receipts without requiring AiiDA on compute hosts
 
 ## Submission Flow
 
@@ -21,7 +23,10 @@ For each submission, the scheduler:
    to allocation management
 5. for explicit `child` or `parent` lifecycle settings, starts or reuses a
    top-level allocation and submits the job through `flux proxy`
-6. for `flux_pool`, submits through the pool's named shared allocation
+6. for `flux_pool`, creates or reuses a pending shared allocation under a short
+   lock, registers a durable child intent, and returns a stable pending alias
+7. advances pooled intents during scheduler polling once the nested broker is
+   ready; reconciles uncertain acceptance before any further submission
 
 ## Pool Runtime Model
 

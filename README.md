@@ -39,6 +39,22 @@ options do not change this behavior. Set `flux_allocation_lifecycle` to
 `child` or `parent` to opt into allocation management, or use `flux_pool` to
 submit through a named shared allocation.
 
+Named pools publish a queued allocation ID without waiting for resources under
+the pool lock. Pooled CalcJobs return stable `allocation:pending-CalcJobUUID`
+IDs; later scheduler polls submit children when the allocation and broker are
+ready. Remote intents and child receipts persist under
+`$HOME/.aiida-flux-scheduler/submissions`. Cancellation affects the intent or
+child, never the shared allocation; ambiguous responses are reconciled rather
+than blindly retried. Plain Flux IDs and existing `allocation:child` IDs remain
+supported.
+
+This path requires Linux, `flock`, and `flux python` remotely. Stop old daemon
+workers before upgrading: mixed lock protocols are unsupported, and stale
+locks from foreign or unknown owners are not automatically stolen based on
+age. Use a controlled site rollout; this is not a claim of live-cluster
+validation or changed scientific results. See the
+[pool schema and operational limits](docs/reference/pool-schema.md).
+
 Start with:
 
 - [Installation guide](docs/install.md)

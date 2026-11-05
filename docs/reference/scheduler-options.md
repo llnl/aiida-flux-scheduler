@@ -50,8 +50,12 @@ builder.metadata.options.resources = {
   resource, queue, account, and walltime options do not enable allocation
   management.
 - `flux_pool` selects a named shared allocation; its definition supplies the
-  allocation resources, timeout, and enablement state. Pool allocations are
-  not cancelled because one child cannot be submitted.
+  allocation resources, timeout, and enablement state. Allocation submission
+  publishes a pending ID without waiting for queue admission. A pooled CalcJob
+  returns `allocation:pending-CalcJobUUID`; later `get_jobs` polls submit its
+  child when the allocation and broker are ready. The alias stays stable after
+  the child ID is recorded. Cancellation affects only the intent or child,
+  never the shared pool allocation.
 - Set `flux_allocation_lifecycle=child` to request one managed allocation per
   calculation, or `parent` to enable root-workchain allocation reuse. Neither
   lifecycle setting can be combined with `flux_pool`.
@@ -68,3 +72,11 @@ builder.metadata.options.resources = {
   documented extension.
 - `custom_scheduler_commands` remains available for site-specific constraints
   and attributes. GPU counts should use `num_gpus_per_mpiproc` instead.
+
+Named pools require Linux remote execution with `flock` and `flux python`, and
+durable journals under `$HOME/.aiida-flux-scheduler/submissions`. Ambiguous
+submission responses require reconciliation, not blind retries. Plain Flux
+IDs and existing `allocation:child` IDs remain supported. Stop old daemon
+workers before upgrading; mixed lock protocols and automatic cross-host
+stale-lock recovery are unsupported. See [Pool Schema](pool-schema.md) for
+generation identity, journal persistence, lock safety, and rollout limits.

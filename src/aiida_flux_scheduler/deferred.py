@@ -7,6 +7,8 @@ Flux jobs JSON object). Detail adds ``jobspec`` or ``intent``. Errors produce
 """
 
 import fcntl
+import hashlib
+import heapq
 import json
 import math
 import os
@@ -19,7 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 COMMAND_TIMEOUT = 5
 Runner = Callable[..., str]
@@ -34,6 +36,52 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ValueError("Request must be an object")
     op = request.get("op")
+    if op == "auto_cleanup_begin":
+        if set(request) != {
+            "op",
+            "retention_seconds",
+            "interval_seconds",
+            "batch_size",
+        } or any(
+            type(request[key]) is not int or request[key] < 1
+            for key in ("retention_seconds", "interval_seconds", "batch_size")
+        ):
+            raise ValueError("Invalid automatic cleanup request")
+        if request["batch_size"] > 1000:
+            raise ValueError("Automatic cleanup batch exceeds 1000 records")
+        return dict(request)
+    if op == "auto_cleanup_finish":
+        if (
+            set(request) != {"op", "token", "approved"}
+            or not isinstance(request["token"], str)
+            or str(UUID(request["token"])) != request["token"]
+        ):
+            raise ValueError("Invalid automatic cleanup token")
+        validate_request(
+            {"op": "cleanup", "retention_seconds": 0, "approved": request["approved"]}
+        )
+        return dict(request)
+    if op in ("cleanup_scan", "cleanup"):
+        keys = {"op", "retention_seconds"} | (
+            {"approved"} if op == "cleanup" else set()
+        )
+        if (
+            set(request) != keys
+            or type(request["retention_seconds"]) is not int
+            or request["retention_seconds"] < 0
+        ):
+            raise ValueError("Invalid cleanup request")
+        if op == "cleanup" and (
+            not isinstance(request["approved"], dict)
+            or any(
+                str(UUID(key)) != key
+                or not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for key, value in request["approved"].items()
+            )
+        ):
+            raise ValueError("Invalid cleanup approvals")
+        return dict(request)
     if op not in ("register", "poll", "cancel", "detail", "lookup", "allocate"):
         raise ValueError("Unsupported deferred operation")
     keys = {"op", "allocation_id", "calculation_uuid"}
@@ -78,6 +126,9 @@ def build_deferred_command(request: dict[str, Any]) -> str:
     request = validate_request(request)
     # Embedding this stdlib-only module avoids version skew or remote AiiDA imports.
     source = Path(__file__).read_text(encoding="utf-8") + "\n_remote_main()\n"
+    if request["op"] in ("auto_cleanup_begin", "auto_cleanup_finish"):
+        # Bound even filesystem stalls in best-effort submission maintenance.
+        source = "import signal\nsignal.alarm(10)\n" + source
     # Some sites expose Python 3.6 through `flux python`. The helper uses only
     # stdlib runtime features available there; strip annotations in that runtime
     # before compilation rather than imposing a remote AiiDA/Python installation.
@@ -277,6 +328,293 @@ def _response(record: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _fingerprint(value: dict[str, Any]) -> str:
+    """Fingerprint canonical JSON for immutable intents and cleanup approvals."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _terminal_receipt(
+    record: dict[str, Any], request: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate a compact terminal receipt and resolve its stable alias."""
+    keys = {
+        "version",
+        "calculation_uuid",
+        "allocation_id",
+        "state",
+        "child_id",
+        "reason",
+        "intent_sha256",
+    }
+    if (
+        set(record) != keys
+        or type(record["version"]) is not int
+        or record["version"] != 2
+    ):
+        raise ValueError("Invalid terminal receipt version or fields")
+    validate_request(
+        {
+            "op": "poll",
+            "calculation_uuid": record["calculation_uuid"],
+            "allocation_id": record["allocation_id"],
+        }
+    )
+    if record["state"] not in ("done", "cancelled") or (
+        record["reason"] is not None and not isinstance(record["reason"], str)
+    ):
+        raise ValueError("Invalid terminal receipt state")
+    if (
+        not isinstance(record["intent_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", record["intent_sha256"]) is None
+    ):
+        raise ValueError("Invalid terminal intent fingerprint")
+    if record["child_id"] is not None:
+        validate_request(
+            {
+                "op": "poll",
+                "calculation_uuid": record["calculation_uuid"],
+                "allocation_id": record["child_id"],
+            }
+        )
+    for key in ("calculation_uuid", "allocation_id"):
+        if key in request and request[key] != record[key]:
+            raise ValueError("Conflicting terminal receipt identity")
+    if (
+        request["op"] == "register"
+        and _fingerprint({k: v for k, v in request.items() if k != "op"})
+        != record["intent_sha256"]
+    ):
+        raise ValueError("Conflicting immutable submission intent")
+    return {
+        **{k: v for k, v in record.items() if k not in ("version", "intent_sha256")},
+        "alias": "pending-" + record["calculation_uuid"],
+        "compacted": True,
+    }
+
+
+def _cleanup(
+    request: dict[str, Any], home: Path, names: list[str] | None = None
+) -> dict[str, Any]:
+    """Compact old terminal journals under their guards using sealed-node approvals."""
+    root = home / ".aiida-flux-scheduler" / "submissions"
+    rows: list[dict[str, Any]] = []
+    if not root.exists():
+        return {"records": rows, "allocation_receipts": "retained"}
+    paths = (
+        sorted(root.glob("*.json"))
+        if names is None
+        else [root / (name + ".json") for name in names]
+    )
+    for path in paths:
+        row = {"calculation_uuid": path.stem, "action": "retained"}
+        try:
+            if str(UUID(path.stem)) != path.stem or path.is_symlink():
+                raise ValueError("Unrecognized journal filename or symlink")
+            if path.with_suffix(".guard").is_symlink():
+                raise ValueError("Journal guard is a symlink")
+            with path.with_suffix(".guard").open("a") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    raise ValueError("Journal is not an object")
+                if record.get("version") == 2:
+                    _terminal_receipt(
+                        record, {"op": "lookup", "calculation_uuid": path.stem}
+                    )
+                    row["reason"] = "already compacted"
+                else:
+                    _validate_record(
+                        record, {"op": "lookup", "calculation_uuid": path.stem}
+                    )
+                    row.update(
+                        allocation_id=record["intent"]["allocation_id"],
+                        state=record["state"],
+                    )
+                    if record["state"] not in ("done", "cancelled") or (
+                        record["state"] == "cancelled" and not record["cancel_complete"]
+                    ):
+                        row["reason"] = "not confirmed terminal"
+                    elif (
+                        time.time() - path.stat().st_mtime
+                        < request["retention_seconds"]
+                    ):
+                        row["reason"] = "within retention period"
+                    else:
+                        digest = _fingerprint(record)
+                        row.update(
+                            action="eligible",
+                            fingerprint=digest,
+                            reason="requires sealed AiiDA CalcJob approval",
+                        )
+                        if request["op"] == "cleanup":
+                            if request["approved"].get(path.stem) != digest:
+                                row.update(
+                                    action="retained",
+                                    reason="missing or stale sealed-node approval",
+                                )
+                            else:
+                                intent = record["intent"]
+                                receipt = {
+                                    "version": 2,
+                                    "intent_sha256": _fingerprint(intent),
+                                    **{
+                                        key: intent[key]
+                                        for key in ("allocation_id", "calculation_uuid")
+                                    },
+                                    **{
+                                        key: record[key]
+                                        for key in ("state", "child_id", "reason")
+                                    },
+                                }
+                                _terminal_receipt(
+                                    receipt,
+                                    {"op": "lookup", "calculation_uuid": path.stem},
+                                )
+                                _write(path, receipt)
+                                row.update(
+                                    action="compacted",
+                                    reason="terminal intent removed; alias receipt preserved",
+                                )
+        except (ValueError, OSError, TypeError, KeyError) as exception:
+            row.update(action="retained", reason=str(exception))
+        rows.append(row)
+    return {"records": rows, "allocation_receipts": "retained"}
+
+
+def _automatic_cleanup(request: dict[str, Any], home: Path) -> dict[str, Any]:
+    """Reserve a bounded rotating batch and finalize it under a separate guard."""
+    root = home / ".aiida-flux-scheduler"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_path = root / "cleanup.json"
+    with (root / "cleanup.guard").open("a") as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"skipped": "cleanup busy", "records": []}
+        state = (
+            json.loads(state_path.read_text())
+            if state_path.exists()
+            else {
+                "version": 1,
+                "last_success": 0,
+                "reserved_at": 0,
+                "token": None,
+                "cursor": "",
+                "names": [],
+                "retention_seconds": 0,
+            }
+        )
+        if (
+            not isinstance(state, dict)
+            or set(state)
+            != {
+                "version",
+                "last_success",
+                "reserved_at",
+                "token",
+                "cursor",
+                "names",
+                "retention_seconds",
+            }
+            or type(state["version"]) is not int
+            or state["version"] != 1
+        ):
+            raise ValueError("Invalid automatic cleanup state")
+        if (
+            any(
+                type(state[key]) not in (int, float)
+                or not math.isfinite(state[key])
+                or state[key] < 0
+                for key in ("last_success", "reserved_at")
+            )
+            or type(state["retention_seconds"]) is not int
+            or state["retention_seconds"] < 0
+            or not isinstance(state["cursor"], str)
+            or (state["cursor"] and str(UUID(state["cursor"])) != state["cursor"])
+            or not isinstance(state["names"], list)
+            or len(state["names"]) > 1000
+            or any(
+                not isinstance(name, str) or str(UUID(name)) != name
+                for name in state["names"]
+            )
+            or (
+                state["token"] is not None
+                and (
+                    not isinstance(state["token"], str)
+                    or str(UUID(state["token"])) != state["token"]
+                )
+            )
+        ):
+            raise ValueError("Invalid automatic cleanup state fields")
+        if request["op"] == "auto_cleanup_finish":
+            if state["token"] != request["token"]:
+                return {"skipped": "stale cleanup token", "records": []}
+            if any(str(UUID(name)) != name for name in state["names"]):
+                raise ValueError("Invalid automatic cleanup batch")
+            report = _cleanup(
+                {
+                    "op": "cleanup",
+                    "retention_seconds": state["retention_seconds"],
+                    "approved": request["approved"],
+                },
+                home,
+                state["names"],
+            )
+            state.update(last_success=time.time(), token=None, names=[])
+            _write(state_path, state)
+            return report
+        now = time.time()
+        if now - state["last_success"] < request["interval_seconds"]:
+            return {"skipped": "cleanup not due", "records": []}
+        if state["token"] is not None and now - state["reserved_at"] < 300:
+            return {"skipped": "cleanup reserved", "records": []}
+
+        def candidates() -> Any:
+            """Bound directory discovery; large histories require explicit cleanup."""
+            directory = root / "submissions"
+            if not directory.exists():
+                return
+            deadline = time.monotonic() + 1
+            with os.scandir(str(directory)) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 10000 or time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "Automatic cleanup discovery budget exceeded; use explicit journal cleanup"
+                        )
+                    if not entry.name.endswith(".json"):
+                        continue
+                    name = entry.name[:-5]
+                    try:
+                        if str(UUID(name)) == name:
+                            yield name
+                    except ValueError:
+                        continue
+
+        # Keep only a batch in memory, rather than sorting the whole history.
+        batch = heapq.nsmallest(
+            request["batch_size"],
+            (name for name in candidates() if name > state["cursor"]),
+        )
+        if not batch:
+            batch = heapq.nsmallest(request["batch_size"], candidates())
+        state.update(
+            token=str(uuid4()),
+            reserved_at=now,
+            names=batch,
+            retention_seconds=request["retention_seconds"],
+            cursor=batch[-1] if batch else "",
+        )
+        _write(state_path, state)
+        report = _cleanup(
+            {"op": "cleanup_scan", "retention_seconds": request["retention_seconds"]},
+            home,
+            batch,
+        )
+        return {**report, "token": state["token"]}
+
+
 def handle_request(
     request: dict[str, Any],
     *,
@@ -295,6 +633,10 @@ def handle_request(
         RuntimeError: If a query fails or another operation holds the guard.
     """
     request = validate_request(request)
+    if request["op"] in ("auto_cleanup_begin", "auto_cleanup_finish"):
+        return _automatic_cleanup(request, home or Path.home())
+    if request["op"] in ("cleanup_scan", "cleanup"):
+        return _cleanup(request, home or Path.home())
     if request["op"] == "allocate":
         return _allocate(request, home or Path.home(), runner)
     root = (home or Path.home()) / ".aiida-flux-scheduler" / "submissions"
@@ -309,6 +651,8 @@ def handle_request(
             ) from exception
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict) and record.get("version") == 2:
+                return _terminal_receipt(record, request)
             _validate_record(record, request)
         elif request["op"] == "lookup":
             return {}

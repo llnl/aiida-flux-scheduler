@@ -27,6 +27,7 @@ from aiida.schedulers.datastructures import (
     NodeNumberJobResource,
 )
 
+from aiida_flux_scheduler.cleanup import cleanup_approval
 from aiida_flux_scheduler.deferred import build_deferred_command
 from aiida_flux_scheduler.pools import (
     POOL_EXTRA_KEY,
@@ -1458,6 +1459,7 @@ class FluxScheduler(Scheduler):
                 {"op": "lookup", "calculation_uuid": str(node.uuid)}
             )
             if receipt:
+                self._maybe_cleanup_journals(node)
                 return f"{receipt['allocation_id']}:pending-{node.uuid}"
         flux_id, created_direct_allocation = self._flux_allocation_with_ownership(pk)
         if flux_id:
@@ -1474,6 +1476,7 @@ class FluxScheduler(Scheduler):
                         ),
                     }
                 )
+                self._maybe_cleanup_journals(node)
                 return f"{flux_id}:pending-{node.uuid}"
         # Already-uploaded scripts may predate direct queue/bank headers. Use
         # recorded options on the command line as well so resuming is safe.
@@ -1508,6 +1511,43 @@ class FluxScheduler(Scheduler):
         total_job_id = f"{flux_id}:{child_job_id}" if flux_id else child_job_id
 
         return total_job_id
+
+    def _maybe_cleanup_journals(self, node: CalcJobNode) -> None:
+        """Run best-effort, throttled maintenance only after a pooled intent is accepted."""
+        try:
+            report = self._run_deferred_request(
+                {
+                    "op": "auto_cleanup_begin",
+                    "retention_seconds": 30 * 86400,
+                    "interval_seconds": 86400,
+                    "batch_size": 100,
+                }
+            )
+            if not report.get("token"):
+                return
+            approved = {}
+            for row in report["records"]:
+                if (
+                    row["action"] == "eligible"
+                    and cleanup_approval(row, node.computer) is None
+                ):
+                    approved[row["calculation_uuid"]] = row["fingerprint"]
+            result = self._run_deferred_request(
+                {
+                    "op": "auto_cleanup_finish",
+                    "token": report["token"],
+                    "approved": approved,
+                }
+            )
+            count = sum(row["action"] == "compacted" for row in result["records"])
+            if count:
+                self.logger.info(
+                    f"Compacted {count} old terminal Flux submission journals."
+                )
+        except Exception as exception:
+            # Acceptance is already durable. Maintenance must not turn success
+            # into an AiiDA transport retry or cause a duplicate submission.
+            self.logger.warning(f"Skipped automatic Flux journal cleanup: {exception}")
 
     @staticmethod
     def _deferred_identity(job_id: str, operation: str) -> dict[str, str]:

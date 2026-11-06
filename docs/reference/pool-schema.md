@@ -93,6 +93,10 @@ records are separate from the AiiDA Group runtime; preserve them across daemon
 restarts and do not edit them to force resubmission.
 Allocation submission receipts live under `$HOME/.aiida-flux-scheduler/allocations`.
 Both receipt types use exact version-one records and persistent guard files.
+`aiida-flux journal cleanup` can explicitly compact old, confirmed terminal
+submission records to version-two alias receipts after checking sealed AiiDA
+CalcJobs. Allocation receipts remain version one and are not pruned. See
+[journal retention](../usage/cli.md#journal-retention) for dry-run and apply usage.
 
 The scheduler ID remains `allocation:pending-CalcJobUUID`. Later `get_jobs`
 polls submit the child once the allocation and nested broker are ready, then

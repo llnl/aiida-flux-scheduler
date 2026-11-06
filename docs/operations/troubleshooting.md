@@ -15,8 +15,9 @@ aiida-flux pool enable <pool-name> --computer <computer-label>
 
 ## `Timed out waiting for Flux pool lock`
 
-Another process is using the pool, or a stale lock directory has not yet aged
-past the scheduler recovery threshold. Retry the submission after a short wait
+Another process is using the pool, or ownership cannot be verified. Automatic
+recovery requires proof of a dead local owner and a minimum age of 300 seconds;
+age alone is insufficient. Retry the submission after a short wait
 and inspect the lock path described in
 [Locking and recovery](locking-and-recovery.md).
 

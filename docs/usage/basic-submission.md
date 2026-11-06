@@ -1,8 +1,11 @@
 # Basic Submission
 
-For direct submissions, provide the scheduler resources through
-`metadata.options.resources`. The plugin uses these values to build the Flux
-allocation that hosts the submitted batch job.
+For direct submissions, provide the resource shape through
+`metadata.options.resources`, and provide queue, account, and walltime through
+the standard `metadata.options` fields. By default, the scheduler submits the
+job directly with `flux batch`, without creating an allocation or using
+`flux proxy`. These ordinary resource and scheduler options do not enable
+allocation management.
 
 ## Required Resource Fields
 
@@ -20,20 +23,29 @@ The scheduler also accepts optional `queue_name` and `account` fields.
 builder.metadata.options.resources = {
     'num_machines': 2,
     'num_mpiprocs_per_machine': 32,
-    'max_wallclock_seconds': 3600,
-    'queue_name': 'debug',
-    'account': 'my-project',
 }
+builder.metadata.options.max_wallclock_seconds = 3600
+builder.metadata.options.queue_name = 'debug'
+builder.metadata.options.account = 'my-project'
 ```
 
 ## Runtime Behavior
 
-When a job is submitted without a pool:
+Without `flux_pool` or an explicit `flux_allocation_lifecycle`, the scheduler
+submits the job directly with `flux batch` and returns the plain Flux job ID.
+It does not create an allocation or use `flux proxy`. Queue, account, and
+walltime options do not change this behavior.
 
-1. the scheduler resolves the root process PK for the current call chain
-2. it looks for an existing top-level Flux allocation named `aiida-<root-pk>`
-3. if no suitable allocation exists, it starts one with `flux alloc`
-4. it submits the job into that allocation with `flux proxy ... flux batch`
+To opt into allocation management, set `flux_allocation_lifecycle` to
+`child` or `parent` in `resources`. The `child` lifecycle starts a fresh
+top-level allocation for each CalcJob and submits into it with
+`flux proxy ... flux batch`; if Flux definitively rejects the child
+submission, the scheduler cancels that allocation. The `parent` lifecycle
+can reuse an allocation across children of the same root WorkChain. It reuses
+an allocation only when its recorded node, CPU, and queue shape is compatible
+with the child request; an allocation with insufficient remaining walltime is
+replaced. The parent lifecycle cannot be combined with `flux_pool`.
 
-If an existing allocation does not have enough remaining walltime for the new
-job, the scheduler cancels it and starts a replacement allocation.
+Alternatively, set `flux_pool` to use a named shared allocation. Pool
+submissions use that allocation regardless of the direct-allocation lifecycle
+setting; do not combine `flux_pool` with `flux_allocation_lifecycle`.

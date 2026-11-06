@@ -50,7 +50,8 @@ gpu_builder.metadata.options.resources = {
 }
 ```
 
-Both jobs are submitted immediately with `flux proxy <pool-id> flux batch ...`.
+Both jobs register durable pending intents immediately. Scheduler polling submits
+them with `flux proxy <pool-id> flux batch ...` once the shared broker is ready.
 The plugin does not reserve resources itself and does not wait for earlier
 children. Flux sees the per-child node, slot, core, and GPU requests and decides
 when and where each job runs. A CPU-only child can therefore consume cores left
@@ -64,9 +65,10 @@ For a pooled submission, the scheduler:
 
 1. acquires a per-pool remote lock
 2. checks the pool runtime state for `current_flux_id`
-3. validates that the referenced Flux allocation still exists
-4. reuses the allocation if the remaining walltime is sufficient
-5. otherwise clears runtime state and starts a replacement allocation while
+3. validates the referenced allocation identity and observed state; unknown
+   observations preserve the reference rather than risking duplication
+4. reuses queued allocations, or running allocations with sufficient walltime
+5. replaces confirmed inactive or insufficient-walltime allocations while
    leaving the old allocation and all of its children to drain
 
 Disabled pools fail at submission time. Missing pool definitions also fail at
@@ -79,9 +81,9 @@ to prevent same-name pools from colliding on a shared remote home directory.
 ## GPU Syntax And Site Verification
 
 Current upstream Flux documents `-g N` / `--gpus-per-slot=N` for `flux batch`
-and `flux alloc`. A slot is the plugin's MPI-process resource unit. The target
-site was not reachable from the development host, so administrators must verify
-that their installed Flux version and resource inventory support this syntax:
+and `flux alloc`. A slot is the plugin's MPI-process resource unit. Administrators
+must verify that their installed Flux version and resource inventory support
+this syntax:
 
 ```bash
 flux --version

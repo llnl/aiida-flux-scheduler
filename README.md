@@ -73,5 +73,8 @@ python -m sphinx -W --keep-going -b html docs docs/_build/html
 
 `LLNL-CODE-2005941`
 
+See the [changelog](CHANGELOG.md) for project history and the
+[0.2.0 release notes](docs/release-notes/v0.2.0.md) for upgrade guidance.
+
 AiiDA-Flux-Scheduler is provided under the MIT license. See
 [LICENSE.txt](LICENSE.txt).

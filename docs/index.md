@@ -10,6 +10,7 @@ Use this documentation to:
 - submit jobs directly to Flux
 - create and operate reusable pool allocations
 - understand runtime state, locking, and recovery behavior
+- review changes and upgrade guidance for each release
 
 ```{toctree}
 :maxdepth: 2
@@ -43,6 +44,13 @@ reference/api
 
 operations/troubleshooting
 operations/locking-and-recovery
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Releases
+
+release-notes/v0.2.0
 ```
 
 ```{toctree}

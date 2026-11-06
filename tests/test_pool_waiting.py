@@ -33,7 +33,14 @@ def pool(aiida_profile_clean, aiida_computer_local):
 
 def test_three_submitters_share_queued_allocation(pool, monkeypatch):
     """Queue delays do not hold the pool lock or trigger another allocation."""
-    group, node = pool
+    group, pooled_node = pool
+    node = SimpleNamespace(
+        user=pooled_node.user,
+        computer=pooled_node.computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     lock_held = []
     creations = []
     job = JobInfo()
@@ -66,7 +73,14 @@ def test_three_submitters_share_queued_allocation(pool, monkeypatch):
 
 def test_unknown_allocation_preserves_reference(pool, monkeypatch):
     """An unavailable observation is not evidence that replacement is safe."""
-    group, node = pool
+    group, pooled_node = pool
+    node = SimpleNamespace(
+        user=pooled_node.user,
+        computer=pooled_node.computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     update_pool_runtime(group, current_flux_id="allocation")
     scheduler = FluxScheduler()
     monkeypatch.setattr(scheduler, "_acquire_pool_lock", lambda *a, **kw: None)
@@ -82,7 +96,14 @@ def test_unknown_allocation_preserves_reference(pool, monkeypatch):
 
 def test_generation_survives_lost_allocation_response(pool, monkeypatch):
     """A retry uses the same allocation reconciliation identity."""
-    group, node = pool
+    group, pooled_node = pool
+    node = SimpleNamespace(
+        user=pooled_node.user,
+        computer=pooled_node.computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     scheduler = FluxScheduler()
     generations = []
     monkeypatch.setattr(scheduler, "_acquire_pool_lock", lambda *a, **kw: None)
@@ -101,6 +122,63 @@ def test_generation_survives_lost_allocation_response(pool, monkeypatch):
     scheduler._get_or_create_pooled_allocation(node, 2, {"pool": "shared"})
     assert generations[0] == generations[1]
     assert get_pool_runtime(group)["current_flux_id"] == "allocation"
+
+
+def test_refreshed_pool_definition_revalidates_job_fit(pool, monkeypatch):
+    """Reject a job that fit the old pool but not its locked, refreshed config."""
+    group, pooled_node = pool
+    node = SimpleNamespace(
+        user=pooled_node.user,
+        computer=pooled_node.computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {
+                "options": {
+                    "resources": {
+                        "num_machines": 2,
+                        "num_mpiprocs_per_machine": 1,
+                    }
+                }
+            }
+        },
+    )
+    scheduler = FluxScheduler()
+    scheduler.flux_values = {"t": 120}
+    released = []
+    monkeypatch.setattr(scheduler, "_acquire_pool_lock", lambda *a, **kw: None)
+    monkeypatch.setattr(scheduler, "_release_pool_lock", released.append)
+    monkeypatch.setattr(
+        scheduler,
+        "_load_pool_definition",
+        lambda *_: {
+            "pool": "shared",
+            "group": group,
+            "resources": {
+                "num_machines": 1,
+                "num_mpiprocs_per_machine": 1,
+                "max_wallclock_seconds": 600,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_start_allocation",
+        lambda *a, **kw: pytest.fail("must reject before allocation creation"),
+    )
+
+    with pytest.raises(SchedulerError, match=r"nodes=2 \(pool 1\)"):
+        scheduler._get_or_create_pooled_allocation(
+            node,
+            1,
+            {
+                "pool": "shared",
+                "resources": {
+                    "num_machines": 2,
+                    "num_mpiprocs_per_machine": 1,
+                },
+            },
+        )
+
+    assert released == [scheduler._get_pool_lock_name(node, "shared")]
 
 
 def test_deferred_poll_stays_queued_without_submit_retry(monkeypatch):

@@ -65,8 +65,10 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         keys = {"op", "retention_seconds"} | (
             {"approved"} if op == "cleanup" else set()
         )
+        optional = {"names"} if op == "cleanup" else set()
         if (
-            set(request) != keys
+            not keys <= set(request)
+            or set(request) - keys - optional
             or type(request["retention_seconds"]) is not int
             or request["retention_seconds"] < 0
         ):
@@ -81,6 +83,24 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             )
         ):
             raise ValueError("Invalid cleanup approvals")
+        if "names" in request:
+            names = request["names"]
+            if (
+                not isinstance(names, list)
+                or len(names) > 100
+            ):
+                raise ValueError("Invalid cleanup journal names")
+            try:
+                if any(str(UUID(name)) != name for name in names):
+                    raise ValueError("Invalid cleanup journal names")
+            except (TypeError, ValueError) as exception:
+                raise ValueError("Invalid cleanup journal names") from exception
+            if len(set(names)) != len(names):
+                raise ValueError("Invalid cleanup journal names")
+            if op == "cleanup" and set(request["approved"]) - set(names):
+                raise ValueError(
+                    "Cleanup approvals must be limited to requested names"
+                )
         return dict(request)
     if op not in ("register", "poll", "cancel", "detail", "lookup", "allocate"):
         raise ValueError("Unsupported deferred operation")
@@ -636,7 +656,11 @@ def handle_request(
     if request["op"] in ("auto_cleanup_begin", "auto_cleanup_finish"):
         return _automatic_cleanup(request, home or Path.home())
     if request["op"] in ("cleanup_scan", "cleanup"):
-        return _cleanup(request, home or Path.home())
+        return _cleanup(
+            request,
+            home or Path.home(),
+            request.get("names") if request["op"] == "cleanup" else None,
+        )
     if request["op"] == "allocate":
         return _allocate(request, home or Path.home(), runner)
     root = (home or Path.home()) / ".aiida-flux-scheduler" / "submissions"
@@ -687,14 +711,35 @@ def handle_request(
             return response
 
         if request["op"] == "cancel":
+            # A confirmed terminal result must not be overwritten or require
+            # a nested broker that may already have shut down.
+            if record["state"] == "done":
+                return _response(record)
+            if record["state"] == "cancelled" and record["cancel_complete"]:
+                return _response(record)
+
             # Persist the tombstone before any remote call, even a failed lookup.
-            uncertain = record["state"] in ("submitting", "ambiguous")
+            uncertain = record["state"] in ("submitting", "ambiguous") or (
+                record["state"] == "cancelled"
+                and record["reason"] == "Cancellation awaiting reconciliation"
+            )
             record["state"] = "cancelled"
             if uncertain:
                 record["reason"] = "Cancellation awaiting reconciliation"
             _write(path, record)
             if record["cancel_complete"]:
                 return _response(record)
+
+            if record["child_id"] is not None or uncertain:
+                # The top-level broker remains queryable after the nested broker
+                # exits. Its confirmed inactivity means no child can still run.
+                parent = _job(runner(["flux", "jobs", allocation, "--json"]))
+                if _job_state(parent) == "INACTIVE":
+                    record["cancel_complete"] = True
+                    record["reason"] = None
+                    _write(path, record)
+                    return _response(record)
+
             if record["child_id"] is None:
                 if (
                     uncertain
@@ -721,6 +766,14 @@ def handle_request(
             return _response(record)
 
         if record["state"] == "cancelled" and not record["cancel_complete"]:
+            # Retry safe terminal reconciliation through the top-level broker;
+            # never infer shutdown from a failed nested-broker request.
+            parent = _job(runner(["flux", "jobs", allocation, "--json"]))
+            if _job_state(parent) == "INACTIVE":
+                record["cancel_complete"] = True
+                record["reason"] = None
+                _write(path, record)
+                return _response(record)
             raise RuntimeError("Cancellation needs reconciliation; retry cancel")
         if record["state"] in ("cancelled", "done"):
             return _response(record)

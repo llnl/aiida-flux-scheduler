@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import subprocess
 from uuid import uuid4
 
 import pytest
@@ -72,6 +73,25 @@ def cleanup(home, approved=None):
     if approved is not None:
         request.update(op="cleanup", approved=approved)
     return deferred.handle_request(request, home=home, runner=no_flux)
+
+
+def test_cleanup_request_names_are_bounded_and_canonical():
+    """Targeted apply requests cannot smuggle arbitrary paths or large batches."""
+    base = {
+        "op": "cleanup",
+        "retention_seconds": RETENTION,
+        "approved": {},
+    }
+    names = [str(uuid4()) for _ in range(100)]
+    assert deferred.validate_request({**base, "names": names})["names"] == names
+    for invalid in (
+        names + [str(uuid4())],
+        [names[0], names[0]],
+        ["../journal"],
+        [None],
+    ):
+        with pytest.raises(ValueError, match="cleanup journal names"):
+            deferred.validate_request({**base, "names": invalid})
 
 
 def snapshot(path):
@@ -429,16 +449,85 @@ def test_cli_dry_run_and_apply_use_sealed_node_approvals(
     )
     assert calls[0] == {"op": "cleanup_scan", "retention_seconds": RETENTION}
     if apply:
-        assert calls[1:] == [
-            {
-                "op": "cleanup",
-                "retention_seconds": RETENTION,
-                "approved": {request["calculation_uuid"]: fingerprint(record)},
-            }
-        ]
+        assert len(calls) == 2
+        assert calls[1] == {
+            "op": "cleanup",
+            "retention_seconds": RETENTION,
+            "approved": {request["calculation_uuid"]: fingerprint(record)},
+            "names": [request["calculation_uuid"]],
+        }
         assert json.loads(path.read_text())["version"] == 2
     else:
         assert len(calls) == 1
         assert snapshot(path) == before[path]
     assert snapshot(missing_path) == before[missing_path]
     assert snapshot(active_path) == before[active_path]
+
+
+def test_cli_apply_batches_large_approval_sets_under_argument_limit(
+    aiida_profile_clean,
+    aiida_computer_local,
+    monkeypatch,
+):
+    """A large manual cleanup scans once and applies bounded journal batches."""
+    monkeypatch.setattr(cli_module, "_load_profile", lambda: None)
+    monkeypatch.setattr(cli_module, "_cleanup_approval", lambda *args: None)
+    computer = aiida_computer_local(label="cleanup-batched", configure=True)
+    rows = []
+    batch_sizes = []
+
+    for _ in range(1300):
+        uuid = str(uuid4())
+        rows.append(
+            {
+                "calculation_uuid": uuid,
+                "allocation_id": "123",
+                "action": "eligible",
+                "fingerprint": "a" * 64,
+                "reason": "requires sealed AiiDA CalcJob approval",
+            }
+        )
+
+    class FakeTransport:
+        """Record request batches and return scan/apply-shaped reports."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def exec_command_wait(self, command):
+            request = json.loads(shlex.split(command)[-1])
+            assert len(command.encode()) < 131072
+            # Exercise execve's argument-size check with the same command
+            # length, rather than relying only on a fake transport parser.
+            probe = subprocess.run(
+                ["bash", "-c", "true " + " " * max(0, len(command) - len("true"))],
+                capture_output=True,
+                check=False,
+            )
+            assert probe.returncode == 0
+            if request["op"] == "cleanup_scan":
+                return 0, json.dumps({"records": rows, "allocation_receipts": "retained"}), ""
+            names = request["names"]
+            assert len(names) <= 100
+            batch_sizes.append(len(names))
+            applied = [
+                {"calculation_uuid": name, "action": "compacted", "reason": "ok"}
+                for name in names
+            ]
+            return 0, json.dumps({"records": applied, "allocation_receipts": "retained"}), ""
+
+    monkeypatch.setattr(orm.Computer, "get_transport", lambda self: FakeTransport())
+    result = CliRunner().invoke(
+        cli_module.cli,
+        ["journal", "cleanup", "--computer", computer.label, "--apply"],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(result.output)
+    assert report["dry_run"] is False
+    assert len(report["records"]) == 1300
+    assert all(row["action"] == "compacted" for row in report["records"])
+    assert batch_sizes == [100] * 13

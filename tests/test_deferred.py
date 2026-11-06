@@ -36,6 +36,7 @@ class FakeFlux:
         self.jobs = []
         self.submit_error = None
         self.lookup_error = None
+        self.proxy_error = None
 
     def __call__(self, args, cwd=None):
         """Simulate the exact commands used by the remote protocol."""
@@ -43,6 +44,8 @@ class FakeFlux:
         if args[:2] == ["flux", "jobs"]:
             return json.dumps(self.parent)
         assert args[:4] == ["flux", "proxy", "123", "flux"]
+        if self.proxy_error:
+            raise self.proxy_error
         command = args[4:]
         if command[0] == "python":
             return json.dumps({"state": self.ready})
@@ -277,6 +280,121 @@ def test_cancel_submitted_only_cancels_child(submission, tmp_path):
     count = len(flux.calls)
     operate(request, tmp_path, flux, "cancel")
     assert len(flux.calls) == count
+
+
+def test_cancel_confirmed_done_journal_after_shutdown_is_idempotent(
+    submission, tmp_path
+):
+    """Cancelling an already completed child does not poison its stable alias."""
+    flux = FakeFlux()
+    flux.parent["state"] = "RUN"
+    handle_request(submission, home=tmp_path)
+    operate(submission, tmp_path, flux, "poll")
+    flux.jobs[0]["state"] = "INACTIVE"
+    assert operate(submission, tmp_path, flux, "poll")["state"] == "done"
+    calls_before_shutdown = len(flux.calls)
+
+    def unavailable(*args, **kwargs):
+        """Fail if a terminal cancel attempts to contact the old broker."""
+        pytest.fail("confirmed terminal cancellation queried shutdown broker")
+
+    cancelled = operate(submission, tmp_path, unavailable, "cancel")
+    polled = operate(submission, tmp_path, unavailable, "poll")
+
+    assert cancelled["state"] == "done"
+    assert polled["state"] == "done"
+    assert len(flux.calls) == calls_before_shutdown
+
+
+def test_cancel_submitted_child_after_parent_shutdown(submission, tmp_path):
+    """Confirmed top-level inactivity completes cancellation without proxying."""
+    request = submission
+    flux = FakeFlux()
+    flux.parent["state"] = "RUN"
+    handle_request(request, home=tmp_path)
+    operate(request, tmp_path, flux, "poll")
+    flux.parent["state"] = "INACTIVE"
+    flux.proxy_error = RuntimeError("nested broker is gone")
+    calls_before_cancel = len(flux.calls)
+
+    result = operate(request, tmp_path, flux, "cancel")
+
+    assert result["state"] == "cancelled"
+    record = json.loads(journal(request, tmp_path).read_text())
+    assert record["state"] == "cancelled"
+    assert record["cancel_complete"] is True
+    assert not any(
+        args[:2] == ["flux", "proxy"]
+        for args, _ in flux.calls[calls_before_cancel:]
+    )
+    assert operate(request, tmp_path, flux, "poll")["state"] == "cancelled"
+
+
+def test_incomplete_cancel_resolves_after_parent_shutdown(submission, tmp_path):
+    """A failed child query stays uncertain until top-level inactivity is known."""
+    request = submission
+    flux = FakeFlux()
+    flux.parent["state"] = "RUN"
+    handle_request(request, home=tmp_path)
+    operate(request, tmp_path, flux, "poll")
+    flux.proxy_error = RuntimeError("nested broker is gone")
+    with pytest.raises(RuntimeError, match="nested broker is gone"):
+        operate(request, tmp_path, flux, "cancel")
+    record = json.loads(journal(request, tmp_path).read_text())
+    assert record["state"] == "cancelled"
+    assert record["cancel_complete"] is False
+
+    flux.parent["state"] = "INACTIVE"
+    resolved = operate(request, tmp_path, flux, "poll")
+
+    assert resolved["state"] == "cancelled"
+    record = json.loads(journal(request, tmp_path).read_text())
+    assert record["cancel_complete"] is True
+
+
+def test_cancel_parent_query_failure_preserves_uncertainty(submission, tmp_path):
+    """An unavailable top-level query is not evidence that the pool ended."""
+    request = submission
+    flux = FakeFlux()
+    flux.parent["state"] = "RUN"
+    handle_request(request, home=tmp_path)
+    operate(request, tmp_path, flux, "poll")
+
+    def parent_unavailable(args, cwd=None):
+        """Fail before returning any evidence about the parent allocation."""
+        if args[:2] == ["flux", "jobs"]:
+            raise RuntimeError("top-level broker unavailable")
+        return flux(args, cwd=cwd)
+
+    with pytest.raises(RuntimeError, match="top-level broker unavailable"):
+        operate(request, tmp_path, parent_unavailable, "cancel")
+    record = json.loads(journal(request, tmp_path).read_text())
+    assert record["state"] == "cancelled"
+    assert record["cancel_complete"] is False
+
+
+def test_cancel_completed_child_after_watcher_stops_parent(submission, tmp_path):
+    """A watcher may stop the pool after a child completes but before AiiDA polls."""
+    request = submission
+    flux = FakeFlux()
+    flux.parent["state"] = "RUN"
+    handle_request(request, home=tmp_path)
+    operate(request, tmp_path, flux, "poll")
+    calls_before_shutdown = len(flux.calls)
+    # The child has completed; the watcher shuts down before its terminal state
+    # is recorded in the deferred journal.
+    flux.jobs[0]["state"] = "INACTIVE"
+    flux.parent["state"] = "INACTIVE"
+
+    result = operate(request, tmp_path, flux, "cancel")
+
+    assert result["state"] == "cancelled"
+    record = json.loads(journal(request, tmp_path).read_text())
+    assert record["cancel_complete"] is True
+    assert not any(
+        args[:2] == ["flux", "proxy"]
+        for args, _ in flux.calls[calls_before_shutdown:]
+    )
 
 
 def test_cancel_ambiguous_reconciles_after_empty_lookup(submission, tmp_path):

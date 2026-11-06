@@ -270,21 +270,8 @@ class FluxScheduler(Scheduler):
                     "".format((job_tmpl.max_wallclock_seconds))
                 )
 
-            # Check if total time is larger than day, hour, or minutes
-            # and convert to float.
-
-            # Days
-            if tot_secs > 86400:
-                time = f"{tot_secs / 86400:.2f}d"
-            # Hours
-            elif tot_secs > 3600:
-                time = f"{tot_secs / 3600:.2f}h"
-            elif tot_secs > 60:
-                time = f"{tot_secs / 60:.2f}m"
-            else:
-                time = tot_secs
-
-            header.append(f"#flux: -t {time}")
+            # Always include units: Flux interprets unitless time limits as minutes.
+            header.append(f"#flux: -t {tot_secs}s")
 
         if (
             isinstance(job_tmpl.custom_scheduler_commands, str)
@@ -401,11 +388,12 @@ class FluxScheduler(Scheduler):
         return self._flux_allocation_with_ownership(pk)[0]
 
     def _flux_allocation_with_ownership(self, pk: int) -> tuple[str, bool]:
-        """Return an allocation ID and whether this submission created it.
+        """Return an allocation ID and whether its lifecycle is exclusively child-owned.
 
-        Direct allocations are child-owned unless callers explicitly select
-        parent reuse. Shared pools own their allocation lifecycle independently
-        and must never be cancelled because an individual child fails.
+        The boolean authorizes cancellation after a failed child submission. It
+        is true only for the explicit ``child`` lifecycle; a newly created or
+        replaced parent allocation may already be shared with other children.
+        Shared pools likewise own their allocation lifecycle independently.
         """
 
         node = load_node(pk)
@@ -445,7 +433,6 @@ class FluxScheduler(Scheduler):
                 f"No flux allocation found for aiida-{parent_pk}. Starting one now."
             )
             flux_id = self._start_allocation(allocation_config, parent_pk)
-            created = True
         elif state.active:
             if not self._direct_allocation_is_compatible(
                 state.job_info, allocation_config
@@ -473,16 +460,14 @@ class FluxScheduler(Scheduler):
                         f"Error during submission, {retval=}\n{stdout=}\n{stderr=}"
                     )
                 flux_id = self._start_allocation(allocation_config, parent_pk)
-                created = True
             else:
                 flux_id = state.flux_id
-                created = False
 
         self.logger.info(
             f"Flux instance for <{parent_pk}> is running with flux id: {flux_id}."
         )
 
-        return flux_id, created
+        return flux_id, False
 
     def _check_allocation(self, parent_pk: int) -> namedtuple:
         """
@@ -884,6 +869,7 @@ class FluxScheduler(Scheduler):
         )
         try:
             allocation_config = self._load_pool_definition(node, pool_name)
+            self._validate_job_fits_pool(node, allocation_config)
             group = get_pool_group(
                 node.user.email,
                 node.computer.label,
@@ -1461,7 +1447,7 @@ class FluxScheduler(Scheduler):
             if receipt:
                 self._maybe_cleanup_journals(node)
                 return f"{receipt['allocation_id']}:pending-{node.uuid}"
-        flux_id, created_direct_allocation = self._flux_allocation_with_ownership(pk)
+        flux_id, child_owned_allocation = self._flux_allocation_with_ownership(pk)
         if flux_id:
             if pooled:
                 self._run_deferred_request(
@@ -1496,14 +1482,13 @@ class FluxScheduler(Scheduler):
         try:
             child_job_id = self._parse_submit_output(*result)
         except SchedulerError:
-            # Only a non-zero command status proves Flux rejected the child.
-            # A transport exception or absent stdout can occur after Flux has
-            # accepted it, so cancelling the allocation in those cases could
-            # kill an unrecorded running child.
-            if created_direct_allocation and result[0] != 0:
+            # A nonzero status or missing output does not necessarily prove
+            # Flux rejected the child. Only an exclusively child-owned
+            # allocation may be cleaned up without risking another child.
+            if child_owned_allocation and result[0] != 0:
                 self.logger.warning(
-                    "Flux rejected child submission; cancelling newly created "
-                    f"direct Flux allocation `{flux_id}`."
+                    "Flux child submission failed; cancelling exclusively owned "
+                    f"allocation `{flux_id}`."
                 )
                 self._cancel_job_if_exists(flux_id)
             raise

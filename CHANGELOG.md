@@ -4,7 +4,7 @@ All notable changes to AiiDA Flux Scheduler are documented here. This project
 follows [Semantic Versioning](https://semver.org/) while it is in the `0.x`
 series; minor releases may include user-visible behavior changes.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-06
 
 ### Added
 

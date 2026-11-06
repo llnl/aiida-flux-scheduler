@@ -44,6 +44,7 @@ def test_submit_job_uses_shell_cd_for_async_transport(monkeypatch):
     monkeypatch.setattr(
         scheduler, "_flux_allocation_with_ownership", lambda _: ("alloc-123", False)
     )
+    monkeypatch.setattr(scheduler, "_get_node_options", lambda _: {})
 
     assert (
         scheduler.submit_job("/remote/work directory", "_aiidasubmit.sh")
@@ -55,8 +56,8 @@ def test_submit_job_uses_shell_cd_for_async_transport(monkeypatch):
     ]
 
 
-def test_submit_job_cancels_new_direct_allocation_when_child_submit_fails(monkeypatch):
-    """Do not leave a direct allocation running after its first child fails."""
+def test_submit_job_cancels_child_owned_allocation_when_child_submit_fails(monkeypatch):
+    """Clean up an exclusively child-owned allocation after rejection."""
 
     scheduler = FluxScheduler()
     monkeypatch.setattr(
@@ -76,6 +77,90 @@ def test_submit_job_cancels_new_direct_allocation_when_child_submit_fails(monkey
         scheduler.submit_job("/remote/work", "_aiidasubmit.sh")
 
     assert cancelled == ["alloc-123"]
+
+
+def test_new_parent_allocation_is_not_exclusively_child_owned(monkeypatch):
+    """Creation does not make a reusable parent allocation safe to cancel."""
+    scheduler = FluxScheduler()
+    node = SimpleNamespace()
+    monkeypatch.setattr("aiida_flux_scheduler.flux.load_node", lambda _: node)
+    monkeypatch.setattr("aiida_flux_scheduler.flux.CalcJobNode", SimpleNamespace)
+    monkeypatch.setattr(scheduler, "_get_parent_pk", lambda _: 10)
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_allocation_config",
+        lambda _: {"pool": None, "resources": {}, "lifecycle": "parent"},
+    )
+    monkeypatch.setattr(
+        scheduler, "_check_allocation", lambda _: SimpleNamespace(active=False)
+    )
+    monkeypatch.setattr(scheduler, "_start_allocation", lambda *_: "alloc-10")
+
+    assert scheduler._flux_allocation_with_ownership(42) == ("alloc-10", False)
+
+
+def test_failed_parent_submission_does_not_cancel_other_child(monkeypatch):
+    """A concurrent child may attach after this call creates a parent allocation."""
+    scheduler = FluxScheduler()
+    node = SimpleNamespace(
+        get_metadata_inputs=lambda: {
+            "metadata": {
+                "options": {"resources": {"flux_allocation_lifecycle": "parent"}}
+            }
+        }
+    )
+    monkeypatch.setattr("aiida_flux_scheduler.flux.load_node", lambda _: node)
+    monkeypatch.setattr("aiida_flux_scheduler.flux.CalcJobNode", SimpleNamespace)
+    monkeypatch.setattr(scheduler, "_get_parent_pk", lambda _: 10)
+    monkeypatch.setattr(
+        scheduler,
+        "_resolve_allocation_config",
+        lambda _: {"pool": None, "resources": {}, "lifecycle": "parent"},
+    )
+    monkeypatch.setattr(
+        scheduler, "_check_allocation", lambda _: SimpleNamespace(active=False)
+    )
+    monkeypatch.setattr(scheduler, "_start_allocation", lambda *_: "alloc-10")
+    scheduler._transport = FakeTransport(
+        [(0, "#flux: --job-name=aiida-42\n#flux: -t 5m\n", "")]
+    )
+    cancelled = []
+    monkeypatch.setattr(scheduler, "_cancel_job_if_exists", cancelled.append)
+
+    commands = []
+
+    def submit_with_concurrent_child(command):
+        """Model another accepted child attaching before this submission fails."""
+        commands.append(command)
+        if len(commands) == 1:
+            return 0, "#flux: --job-name=aiida-42\n#flux: -t 5m\n", ""
+        assert "flux proxy alloc-10 flux batch" in command
+        return 1, "", "batch failed"
+
+    monkeypatch.setattr(
+        scheduler.transport, "exec_command_wait", submit_with_concurrent_child
+    )
+    with pytest.raises(Exception, match="Error during submission"):
+        scheduler.submit_job("/remote/work", "_aiidasubmit.sh")
+
+    assert cancelled == []
+
+
+@pytest.mark.parametrize("seconds", [1, 30, 60, 61, 3601, 86401])
+def test_generated_walltime_is_explicit_seconds(seconds):
+    """Generated Flux directives preserve exact AiiDA walltime units."""
+    scheduler = FluxScheduler()
+    template = JobTemplate()
+    template.job_name = "aiida-42"
+    template.job_resource = FluxJobResource(
+        num_machines=1, num_mpiprocs_per_machine=1
+    )
+    template.max_wallclock_seconds = seconds
+    header = scheduler._get_submit_script_header(template)
+    assert f"#flux: -t {seconds}s" in header
+    scheduler._transport = FakeTransport([(0, header, "")])
+    assert scheduler._parse_pk("/remote", "submit.sh") == 42
+    assert scheduler.flux_values["t"] == seconds
 
 
 def test_submit_job_does_not_cancel_reused_or_pooled_allocation_on_failure(monkeypatch):
@@ -101,7 +186,7 @@ def test_submit_job_does_not_cancel_reused_or_pooled_allocation_on_failure(monke
 
 
 def test_submit_job_does_not_cancel_on_ambiguous_child_submission(monkeypatch):
-    """Keep a new allocation when Flux may have accepted an unreported child."""
+    """Missing output after status zero is not proof of rejected submission."""
 
     scheduler = FluxScheduler()
     monkeypatch.setattr(
@@ -112,7 +197,7 @@ def test_submit_job_does_not_cancel_on_ambiguous_child_submission(monkeypatch):
         [(0, "#flux: --job-name=aiida-42\n#flux: -t 5m\n", ""), (0, "", "")]
     )
     monkeypatch.setattr(
-        scheduler, "_flux_allocation_with_ownership", lambda _: ("alloc-123", True)
+        scheduler, "_flux_allocation_with_ownership", lambda _: ("alloc-123", False)
     )
     monkeypatch.setattr(
         scheduler,
@@ -689,7 +774,13 @@ def test_get_or_create_pooled_allocation_reuses_existing_runtime(
         },
     )
 
-    node = SimpleNamespace(user=group.user, computer=computer)
+    node = SimpleNamespace(
+        user=group.user,
+        computer=computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     flux_id = scheduler._get_or_create_pooled_allocation(
         node,
         parent_pk=42,
@@ -788,7 +879,13 @@ def test_get_or_create_pooled_allocation_drains_expired_runtime(
 
     monkeypatch.setattr(scheduler, "_get_top_level_job", lambda flux_id: job)
 
-    node = SimpleNamespace(user=group.user, computer=computer)
+    node = SimpleNamespace(
+        user=group.user,
+        computer=computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     flux_id = scheduler._get_or_create_pooled_allocation(
         node,
         parent_pk=77,
@@ -839,7 +936,13 @@ def test_get_or_create_pooled_allocation_replaces_inactive_runtime(
     job.wallclock_time_seconds = 10
     monkeypatch.setattr(scheduler, "_get_top_level_job", lambda flux_id: job)
 
-    node = SimpleNamespace(user=group.user, computer=computer)
+    node = SimpleNamespace(
+        user=group.user,
+        computer=computer,
+        get_metadata_inputs=lambda: {
+            "metadata": {"options": {"resources": {"num_machines": 1}}}
+        },
+    )
     flux_id = scheduler._get_or_create_pooled_allocation(
         node,
         parent_pk=99,

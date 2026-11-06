@@ -327,22 +327,26 @@ def journal_cleanup(computer_label: str, retention_days: int, apply: bool) -> No
                     approved[row["calculation_uuid"]] = row["fingerprint"]
                     row["reason"] = "sealed CalcJob; eligible for compaction"
             if apply:
-                applied = execute(
-                    {
-                        "op": "cleanup",
-                        "retention_seconds": retention,
-                        "approved": approved,
-                    }
-                )
-                reasons = {
-                    row["calculation_uuid"]: row["reason"]
-                    for row in report["records"]
-                    if row["action"] == "retained"
-                }
-                for row in applied["records"]:
-                    if row["calculation_uuid"] in reasons:
-                        row["reason"] = reasons[row["calculation_uuid"]]
-                report = applied
+                applied_by_uuid = {}
+                approved_names = list(approved)
+                for start in range(0, len(approved_names), 100):
+                    names = approved_names[start : start + 100]
+                    applied = execute(
+                        {
+                            "op": "cleanup",
+                            "retention_seconds": retention,
+                            "approved": {
+                                name: approved[name] for name in names
+                            },
+                            "names": names,
+                        }
+                    )
+                    applied_by_uuid.update(
+                        (row["calculation_uuid"], row)
+                        for row in applied["records"]
+                    )
+                for row in report["records"]:
+                    row.update(applied_by_uuid.get(row["calculation_uuid"], {}))
             report["dry_run"] = not apply
             click.echo(json.dumps(report, indent=2, sort_keys=True))
     except (exceptions.NotExistent, ValueError, OSError) as exception:
